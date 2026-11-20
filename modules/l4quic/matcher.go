@@ -131,6 +131,28 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		}
 	}
 
+	var alpnMismatch bool
+	if len(tlsConf.NextProtos) > 0 {
+		expectedALPNs := make(map[string]struct{}, len(tlsConf.NextProtos))
+		for _, p := range tlsConf.NextProtos {
+			expectedALPNs[p] = struct{}{}
+		}
+		tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			hasMatchingALPN := false
+			for _, p := range info.SupportedProtos {
+				if _, ok := expectedALPNs[p]; ok {
+					hasMatchingALPN = true
+					break
+				}
+			}
+			if !hasMatchingALPN {
+				alpnMismatch = true
+				return nil, errors.New("quic matcher: ALPN mismatch")
+			}
+			return nil, nil
+		}
+	}
+
 	// Create a new fakePacketConn pipe
 	serverFPC, clientFPC := newFakePacketConnPipe(&fakePipeAddr{ID: newRand(), TS: time.Now()}, nil)
 
@@ -231,7 +253,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		// returns (false, nil) so layer4 marks NotMatched and falls through;
 		// Canceled (WaitForMore fired) returns ErrConsumedAllPrefetchedBytes
 		// so the next prefetch round can complete the handshake.
-		if errors.Is(qContext.Err(), context.DeadlineExceeded) {
+		if alpnMismatch || errors.Is(qContext.Err(), context.DeadlineExceeded) {
 			return false, nil
 		}
 		return false, layer4.ErrConsumedAllPrefetchedBytes
