@@ -16,6 +16,7 @@ package layer4
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -103,46 +104,12 @@ func (s *Server) serve(ln net.Listener) error {
 	}
 }
 
-type resilientPacketConn struct {
-	net.PacketConn
-	logger *zap.Logger
-	closed atomic.Bool
-}
-
-func newResilientPacketConn(pc net.PacketConn, logger *zap.Logger) *resilientPacketConn {
-	return &resilientPacketConn{
-		PacketConn: pc,
-		logger:     logger,
-	}
-}
-
-func (r *resilientPacketConn) isClosed() bool {
-	return r.closed.Load()
-}
-
-func (r *resilientPacketConn) Close() error {
-	r.closed.Store(true)
-	return r.PacketConn.Close()
-}
-
-func (r *resilientPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	for {
-		n, addr, err = r.PacketConn.ReadFrom(b)
-		if err == nil || r.closed.Load() {
-			return n, addr, err
-		}
-		if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
-			r.closed.Store(true)
-			return n, addr, err
-		}
-		var nerr net.Error
-		if errors.As(err, &nerr) && nerr.Timeout() {
-			return n, addr, err
-		}
-		// Transient packet or ICMP errors on UDP sockets (e.g., ECONNREFUSED on Linux,
-		// WSAECONNRESET on Windows, ENOBUFS) must not kill the entire listener!
-		r.logger.Debug("transient UDP socket read error ignored", zap.Error(err))
-	}
+// socketClosed reports whether the socket owned by Caddy has really been
+// closed. hybrid wraps every splitter failure in net.ErrClosed, so the error
+// from AcceptSplit alone cannot tell a real shutdown from a recoverable
+// failure. Probing the socket can.
+func socketClosed(pc net.PacketConn) bool {
+	return errors.Is(pc.SetReadDeadline(time.Time{}), net.ErrClosed)
 }
 
 func (s *Server) servePacket(pc net.PacketConn) error {
@@ -154,9 +121,15 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 	// to be scheduled.
 	// The splitter never closes the socket, which Caddy may not expect closed
 	// more than once, while closing it makes the splitter stop on its own.
+	// Its Close, used on failure, only interrupts the blocked reads so that the
+	// old splitter is fully gone before a replacement starts reading.
 	rpc := newResilientPacketConn(pc, s.logger)
+	interrupt := func() error {
+		_ = rpc.SetWriteDeadline(time.Unix(1, 0))
+		return rpc.SetReadDeadline(time.Unix(1, 0))
+	}
 	for {
-		ln := hybrid.Split(hybrid.FakeClosePacketConn(rpc, nil), &hybrid.SplitConfig{
+		ln := hybrid.Split(hybrid.FakeClosePacketConn(rpc, interrupt), &hybrid.SplitConfig{
 			AcceptQueueSize: udpAcceptQueueSize,
 			IdleTimeout:     time.Duration(s.IdleTimeout),
 			ReadBufferSize:  udpBufSize,
@@ -178,7 +151,10 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 					zap.String("address", ln.Addr().String()),
 					zap.Any("drops", ln.Stats()),
 				)
-				if rpc.isClosed() || errors.Is(err, net.ErrClosed) {
+				// A real shutdown is the only reason to stop serving. Any other
+				// failure of the splitter is recoverable: rebuild it on the same
+				// socket so a transient problem never needs a Caddy restart.
+				if rpc.isClosed() || socketClosed(pc) {
 					return err
 				}
 				s.logger.Warn("packet connection splitter stopped unexpectedly, restarting",
@@ -186,9 +162,10 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 					zap.String("address", pc.LocalAddr().String()),
 					zap.Error(err),
 				)
+				time.Sleep(10 * time.Millisecond)
 				break
 			}
-			go s.handle(newPacketConn(sc))
+			go s.handle(newPacketConn(sc, false))
 		}
 	}
 }
@@ -298,19 +275,50 @@ type packetConn struct {
 	firstInitialTime time.Time
 	hasData          atomic.Bool
 	writtenPackets   atomic.Uint64
+	released         atomic.Bool
+	// hasFallback reports whether the splitter can take over this flow. With a
+	// fallback, a stale flow is handed over; without one, it is ended so the
+	// next packet re-enters matching immediately.
+	hasFallback bool
 }
 
-// parseQUICInitialDCID parses the Destination Connection ID from a QUIC Initial packet (RFC 9000).
+const (
+	// quicInitialMinPacketSize is the minimum size of a client Initial datagram
+	// (RFC 9000 §14.1). Shorter packets cannot be Initial packets.
+	quicInitialMinPacketSize = 1200
+	// quicVersion2 is RFC 9369. In v2 the Initial type bits are 0b01 rather
+	// than the 0b00 used by v1, so the first byte is 0xd0 instead of 0xc0.
+	quicVersion2 = uint32(0x6b3343cf)
+
+	// A QUIC client retransmits its Initial on a growing PTO. If nothing has
+	// been written back after this long, the flow is almost certainly
+	// misrouted or the upstream is dead, and a new Initial must re-enter
+	// matching instead of being fed to the stale handler.
+	quicStaleFlowSilentTimeout = 300 * time.Millisecond
+)
+
+// parseQUICInitialDCID parses the Destination Connection ID from a QUIC
+// Initial packet (RFC 9000 §17.2, RFC 9369). It handles both v1 and v2 long
+// headers; other long-header packet types are deliberately not reported.
 func parseQUICInitialDCID(b []byte) ([]byte, bool) {
-	if len(b) < 1200 {
+	if len(b) < quicInitialMinPacketSize {
 		return nil, false
 	}
-	// Long Header Form (0x80) + Fixed Bit (0x40) + Packet Type Initial (0x00) -> 0xC0
-	if (b[0] & 0xf0) != 0xc0 {
+	// Long Header (0x80) and Fixed Bit (0x40) must both be set.
+	if b[0]&0xc0 != 0xc0 {
 		return nil, false
 	}
-	// Version must not be 0 (Version Negotiation is sent by server, not client)
-	if b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0 {
+	version := binary.BigEndian.Uint32(b[1:5])
+	// Version 0 is for Version Negotiation, which is sent by the server.
+	if version == 0 {
+		return nil, false
+	}
+	packetType := (b[0] >> 4) & 0x03
+	if version == quicVersion2 {
+		if packetType != 0x01 { // v2: Retry=0, Initial=1, 0-RTT=2, Handshake=3
+			return nil, false
+		}
+	} else if packetType != 0x00 { // v1: Initial=0, 0-RTT=1, Handshake=2, Retry=3
 		return nil, false
 	}
 	dcidLen := int(b[5])
@@ -329,11 +337,12 @@ func isDTLSClientHello(b []byte) bool {
 // newPacketConn returns a packetConn serving the flow of sc. Its goroutine
 // moves the packets from sc to readCh, and closes readCh once sc is closed,
 // by Close or by the splitter, as the flow is idle or the socket is closed.
-func newPacketConn(sc hybrid.SplitConn) *packetConn {
+func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 	pc := &packetConn{
-		PacketConn: sc,
-		addr:       sc.RemoteAddr(),
-		readCh:     make(chan *packet, 5),
+		PacketConn:  sc,
+		addr:        sc.RemoteAddr(),
+		readCh:      make(chan *packet, 5),
+		hasFallback: hasFallback,
 	}
 	go func() {
 		defer close(pc.readCh)
@@ -356,24 +365,36 @@ func newPacketConn(sc hybrid.SplitConn) *packetConn {
 						pc.initialDCID = append([]byte(nil), dcid...)
 						pc.firstInitialTime = time.Now()
 					} else {
+						elapsed := time.Since(pc.firstInitialTime)
 						isDifferentDCID := !bytes.Equal(pc.initialDCID, dcid)
 						alreadyHasData := pc.hasData.Load()
-						retransmitAfterDelay := time.Since(pc.firstInitialTime) > 800*time.Millisecond
-						upstreamSilent := pc.writtenPackets.Load() == 0 && time.Since(pc.firstInitialTime) > 300*time.Millisecond
+						upstreamSilent := pc.writtenPackets.Load() == 0 && elapsed > quicStaleFlowSilentTimeout
 
-						if isDifferentDCID || alreadyHasData || upstreamSilent || retransmitAfterDelay {
-							// Client started a new handshake on the same client port or is recovering
-							// from a failed/misrouted handshake. Terminate this stale flow immediately
-							// so that hybrid.Split and downstream handlers release their state.
-							_ = pc.PacketConn.Close()
-							udpBufPool.Put(buf)
+						if isDifferentDCID || alreadyHasData || upstreamSilent {
+							// This flow is stale: the client started a new handshake on
+							// the same port. With a fallback, hand the whole flow over
+							// so the new Initial reaches the fallback proxy at once.
+							// Without one, end the flow so the next packet re-enters
+							// matching immediately instead of waiting for idle timeout.
+							if pc.hasFallback {
+								pc.releaseToFallback(&packet{pooledBuf: buf, n: n})
+							} else {
+								_ = pc.PacketConn.Close()
+								udpBufPool.Put(buf)
+							}
 							return
 						}
 					}
 				} else if isDTLSClientHello(pkt) {
-					if pc.hasData.Load() || (pc.writtenPackets.Load() == 0 && !pc.firstInitialTime.IsZero() && time.Since(pc.firstInitialTime) > 300*time.Millisecond) {
-						_ = pc.PacketConn.Close()
-						udpBufPool.Put(buf)
+					if pc.hasData.Load() || (!pc.firstInitialTime.IsZero() &&
+						pc.writtenPackets.Load() == 0 &&
+						time.Since(pc.firstInitialTime) > quicStaleFlowSilentTimeout) {
+						if pc.hasFallback {
+							pc.releaseToFallback(&packet{pooledBuf: buf, n: n})
+						} else {
+							_ = pc.PacketConn.Close()
+							udpBufPool.Put(buf)
+						}
 						return
 					}
 					pc.hasData.Store(true)
@@ -541,6 +562,9 @@ func (pc *packetConn) RemoteAddr() net.Addr { return pc.addr }
 // connection and the later packets of the flow follow. It closes the split
 // connection, so Close only releases what's left afterwards.
 func (pc *packetConn) release(pkts [][]byte) error {
+	if !pc.released.CompareAndSwap(false, true) {
+		return nil
+	}
 	// Make the goroutine moving the packets close readCh without taking another
 	// packet from the split connection, as an exceeded deadline prevails over
 	// the packets queued on it
@@ -563,6 +587,42 @@ func (pc *packetConn) release(pkts [][]byte) error {
 		udpBufPool.Put(buf)
 	}
 	return err
+}
+
+// releaseToFallback is called by the packet-moving goroutine when the flow is
+// recognized as stale. It hands the flow, the offending packet and everything
+// already queued to the splitter's fallback. That way an unrecognized UDP
+// handshake is never silently dropped: it reaches the fallback proxy at once,
+// and the later packets of the same flow follow it there. Without a fallback,
+// hybrid counts them as dropped, which is no worse than before.
+func (pc *packetConn) releaseToFallback(pkt *packet) {
+	if !pc.released.CompareAndSwap(false, true) {
+		return
+	}
+	var pkts, bufs [][]byte
+	if pkt != nil {
+		pkts = append(pkts, pkt.pooledBuf[:pkt.n])
+		bufs = append(bufs, pkt.pooledBuf)
+	}
+	for {
+		select {
+		case queued := <-pc.readCh:
+			if queued != nil {
+				pkts = append(pkts, queued.pooledBuf[:queued.n])
+				bufs = append(bufs, queued.pooledBuf)
+			}
+		default:
+			goto handOver
+		}
+	}
+handOver:
+	_ = pc.PacketConn.SetReadDeadline(time.Unix(1, 0))
+	if sc, ok := pc.PacketConn.(hybrid.SplitConn); ok {
+		_ = sc.Release(pkts...)
+	}
+	for _, buf := range bufs {
+		udpBufPool.Put(buf)
+	}
 }
 
 var udpBufPool = sync.Pool{

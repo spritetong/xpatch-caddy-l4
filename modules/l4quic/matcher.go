@@ -29,6 +29,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -76,6 +77,17 @@ func (q quicPipeWriter) Write(p []byte) (int, error) {
 		return 0, errors.New("invalid length for quic packet")
 	}
 	return q.Writer.Write(p)
+}
+
+// hasMatchingALPN reports whether the client offered at least one of the
+// configured ALPNs. It is only called when at least one ALPN is configured.
+func hasMatchingALPN(supported []string, expected map[string]struct{}) bool {
+	for _, p := range supported {
+		if _, ok := expected[p]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Match returns true if the connection looks like QUIC.
@@ -131,22 +143,17 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		}
 	}
 
-	var alpnMismatch bool
+	// GetConfigForClient runs on the handshake goroutine, while Match reads
+	// the flag after Accept returns. Keep the handoff race-free.
+	var alpnMismatch atomic.Bool
 	if len(tlsConf.NextProtos) > 0 {
 		expectedALPNs := make(map[string]struct{}, len(tlsConf.NextProtos))
 		for _, p := range tlsConf.NextProtos {
 			expectedALPNs[p] = struct{}{}
 		}
 		tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
-			hasMatchingALPN := false
-			for _, p := range info.SupportedProtos {
-				if _, ok := expectedALPNs[p]; ok {
-					hasMatchingALPN = true
-					break
-				}
-			}
-			if !hasMatchingALPN {
-				alpnMismatch = true
+			if !hasMatchingALPN(info.SupportedProtos, expectedALPNs) {
+				alpnMismatch.Store(true)
 				return nil, errors.New("quic matcher: ALPN mismatch")
 			}
 			return nil, nil
@@ -253,7 +260,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		// returns (false, nil) so layer4 marks NotMatched and falls through;
 		// Canceled (WaitForMore fired) returns ErrConsumedAllPrefetchedBytes
 		// so the next prefetch round can complete the handshake.
-		if alpnMismatch || errors.Is(qContext.Err(), context.DeadlineExceeded) {
+		if alpnMismatch.Load() || errors.Is(qContext.Err(), context.DeadlineExceeded) {
 			return false, nil
 		}
 		return false, layer4.ErrConsumedAllPrefetchedBytes

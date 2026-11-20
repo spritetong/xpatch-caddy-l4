@@ -3,6 +3,7 @@ package layer4
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -709,3 +710,158 @@ func TestServePacketNewQUICInitialResetsFlow(t *testing.T) {
 	}, func() string { return "second handler to start" })
 }
 
+type oneShotWriteClosedPacketConn struct {
+	net.PacketConn
+	arm  atomic.Bool
+	fail atomic.Bool
+}
+
+func (f *oneShotWriteClosedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if f.arm.Load() && f.fail.CompareAndSwap(false, true) {
+		return 0, net.ErrClosed
+	}
+	return f.PacketConn.WriteTo(b, addr)
+}
+
+// A write failure that looks like a closed connection must not take down the
+// UDP listener when the socket itself is still open.
+func TestServePacketRestartsAfterSplitterFailure(t *testing.T) {
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	w := &oneShotWriteClosedPacketConn{PacketConn: udp}
+	server := &Server{
+		compiledRoute: HandlerFunc(func(cx *Connection) error {
+			_ = cx.SetReadDeadline(time.Time{})
+			buf := make([]byte, 64)
+			for {
+				n, err := cx.Read(buf)
+				if err != nil {
+					return nil
+				}
+				if _, err := cx.Write(buf[:n]); err != nil {
+					return nil
+				}
+			}
+		}),
+		logger:      zap.NewNop(),
+		IdleTimeout: caddy.Duration(30 * time.Second),
+	}
+
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.servePacket(w)
+		close(serveDone)
+	}()
+	t.Cleanup(func() {
+		_ = udp.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(3 * time.Second):
+			t.Error("servePacket did not return after socket close")
+		}
+	})
+
+	c := dialPacketServer(t, udp.LocalAddr().String())
+	w.arm.Store(true)
+	if _, err := c.Write([]byte("trigger")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if _, err := c.Write([]byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("listener did not recover after splitter failure: %v", err)
+	}
+	if string(buf[:n]) != "after" {
+		t.Fatalf("got %q after restart, want %q", buf[:n], "after")
+	}
+}
+
+func TestParseQUICInitialDCIDVersions(t *testing.T) {
+	dcid := []byte("DCID")
+	v1 := makeDummyQUICInitial(dcid)
+	got, ok := parseQUICInitialDCID(v1)
+	if !ok || !bytes.Equal(got, dcid) {
+		t.Fatalf("v1 Initial: got %q, %v", got, ok)
+	}
+
+	v2 := bytes.Clone(v1)
+	v2[0] = 0xd0 // v2 Initial type bits
+	binary.BigEndian.PutUint32(v2[1:5], quicVersion2)
+	got, ok = parseQUICInitialDCID(v2)
+	if !ok || !bytes.Equal(got, dcid) {
+		t.Fatalf("v2 Initial: got %q, %v", got, ok)
+	}
+
+	handshake := bytes.Clone(v1)
+	handshake[0] = 0xe0 // v1 Handshake, not Initial
+	if _, ok := parseQUICInitialDCID(handshake); ok {
+		t.Error("v1 Handshake must not be reported as Initial")
+	}
+
+	v2Handshake := bytes.Clone(v2)
+	v2Handshake[0] = 0xf0 // v2 Handshake, not Initial
+	if _, ok := parseQUICInitialDCID(v2Handshake); ok {
+		t.Error("v2 Handshake must not be reported as Initial")
+	}
+
+	versionNegotiation := bytes.Clone(v1)
+	clear(versionNegotiation[1:5])
+	if _, ok := parseQUICInitialDCID(versionNegotiation); ok {
+		t.Error("version negotiation must not be reported as Initial")
+	}
+}
+
+// A live handshake may retransmit its Initial well after 800ms. The old
+// unconditional timer killed such flows even while the upstream was answering.
+func TestServePacketLiveHandshakeSurvivesLateRetransmit(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstDone)
+				}
+				return nil
+			}
+			_, _ = cx.Write([]byte("handshake-progress"))
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+	p := makeDummyQUICInitial([]byte("LIVE"))
+	if _, err := c.Write(p); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	time.Sleep(900 * time.Millisecond)
+	if _, err := c.Write(p); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstDone:
+		t.Fatal("live handshake was reset by a late Initial retransmission")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := handlerCount.Load(); got != 1 {
+		t.Fatalf("handler count = %d, want 1", got)
+	}
+}

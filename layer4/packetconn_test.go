@@ -25,6 +25,7 @@ func init() {
 	caddy.RegisterModule(&testErrorMatcher{})
 	caddy.RegisterModule(&testPrefixMatcher{})
 	caddy.RegisterModule(&testWaitMatcher{})
+	caddy.RegisterModule(&testHoldHandler{})
 }
 
 // testErrorMatcher fails matching with an error.
@@ -72,6 +73,24 @@ func (*testEchoHandler) CaddyModule() caddy.ModuleInfo {
 }
 
 func (*testEchoHandler) Handle(cx *Connection, _ Handler) error { return echoHandler(cx) }
+
+// testHoldHandler reads one packet and then holds the flow without reading
+// anything else, so later packets remain queued on the split connection.
+type testHoldHandler struct{}
+
+func (*testHoldHandler) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "layer4.handlers.testHold",
+		New: func() caddy.Module { return new(testHoldHandler) },
+	}
+}
+
+func (*testHoldHandler) Handle(cx *Connection, _ Handler) error {
+	buf := make([]byte, 1500)
+	_, _ = cx.Read(buf)
+	<-time.After(2 * time.Second)
+	return nil
+}
 
 // testPrefixMatcher matches once it has read Prefix, which makes the routes
 // prefetch as many packets as it takes.
@@ -753,5 +772,123 @@ func TestPCWUDP(t *testing.T) {
 				t.Errorf("the fallback connection got a packet from %s, want %s", addr, released.LocalAddr())
 			}
 		})
+	}
+}
+
+type oneShotFlakyPacketConn struct {
+	net.PacketConn
+	remaining int
+}
+
+func (f *oneShotFlakyPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	if f.remaining > 0 {
+		f.remaining--
+		return 0, nil, errors.New("synthetic transient UDP read error")
+	}
+	return f.PacketConn.ReadFrom(b)
+}
+
+// The Caddy packet-conn wrapper path must survive a datagram-local read error
+// just like the standalone layer4 app does. Otherwise the splitter stops and
+// the HTTP/3 fallback goes down until Caddy is restarted.
+func TestPacketConnWrapperSurvivesTransientReadError(t *testing.T) {
+	inner, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+
+	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	pcw := &PacketConnWrapper{
+		MatchingTimeout: caddy.Duration(50 * time.Millisecond),
+		IdleTimeout:     caddy.Duration(time.Second),
+		logger:          zap.NewNop(),
+	}
+	pcw.compiledRoute = pcw.Routes.Compile(pcw.logger, time.Duration(pcw.MatchingTimeout), nopHandler{})
+
+	flaky := &oneShotFlakyPacketConn{PacketConn: inner, remaining: 1}
+	fallback := pcw.WrapPacketConn(flaky)
+	defer fallback.Close()
+
+	if _, err := peer.WriteTo([]byte("after-error"), inner.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 64)
+	_ = fallback.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := fallback.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("fallback connection failed after transient read error: %v", err)
+	}
+	if string(buf[:n]) != "after-error" {
+		t.Fatalf("fallback got %q, want %q", buf[:n], "after-error")
+	}
+}
+
+// A new QUIC handshake on an existing flow must be handed to the fallback,
+// not dropped: unrecognizable UDP traffic has to reach the fallback proxy.
+func TestPacketConnWrapperStaleFlowReachesFallback(t *testing.T) {
+	inner, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+
+	peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	first := makeDummyQUICInitial([]byte("AAAA"))
+	second := makeDummyQUICInitial([]byte("BBBB"))
+
+	// Hold the first flow without draining anything else, so older packets stay
+	// queued while the new Initial arrives.
+	pcw := &PacketConnWrapper{
+		Routes:          RouteList{testRoute("testReadLengthMatcher", `{"length":10}`, "testHold")},
+		MatchingTimeout: caddy.Duration(time.Second),
+		IdleTimeout:     caddy.Duration(5 * time.Second),
+	}
+	provisionWrapper(t, pcw)
+	fallback := pcw.WrapPacketConn(inner)
+	defer fallback.Close()
+
+	if _, err := peer.WriteTo(first, inner.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	// Give the first flow a chance to be matched and served by the route.
+	time.Sleep(50 * time.Millisecond)
+	// An older packet of the stale flow is still queued when the new Initial
+	// arrives. The new Initial must preempt it on the fallback connection.
+	oldPacket := []byte("old-flow-data")
+	if _, err := peer.WriteTo(oldPacket, inner.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := peer.WriteTo(second, inner.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1500)
+	_ = fallback.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, _, err := fallback.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("fallback did not get the new Initial: %v", err)
+	}
+	if !bytes.Equal(buf[:n], second) {
+		t.Fatalf("fallback got %d bytes first, want the new Initial (%d bytes)", n, len(second))
+	}
+	n, _, err = fallback.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("fallback did not get the queued old packet: %v", err)
+	}
+	if !bytes.Equal(buf[:n], oldPacket) {
+		t.Fatalf("fallback got %q after the new Initial, want %q", buf[:n], oldPacket)
 	}
 }

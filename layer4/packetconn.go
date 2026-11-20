@@ -68,7 +68,16 @@ func (pcw *PacketConnWrapper) Provision(ctx caddy.Context) error {
 func (pcw *PacketConnWrapper) WrapPacketConn(pc net.PacketConn) net.PacketConn {
 	// The splitter never closes pc, as its owner, e.g. Caddy, may not expect it closed more than once,
 	// while closing pc makes the splitter stop on its own, with Accept returning the error that has stopped it.
-	ln := hybrid.Split(hybrid.FakeClosePacketConn(pc, nil), &hybrid.SplitConfig{
+	// Shield the socket from datagram-local read errors first: the splitter stops on the first error it
+	// sees, which would otherwise take down all flows, including the HTTP/3 fallback, until a restart.
+	rpc := newResilientPacketConn(pc, pcw.logger)
+	// If the splitter ever fails, make its fake Close interrupt the blocked
+	// reads instead of doing nothing, so no reader is left behind.
+	interrupt := func() error {
+		_ = rpc.SetWriteDeadline(time.Unix(1, 0))
+		return rpc.SetReadDeadline(time.Unix(1, 0))
+	}
+	ln := hybrid.Split(hybrid.FakeClosePacketConn(rpc, interrupt), &hybrid.SplitConfig{
 		AcceptQueueSize: udpAcceptQueueSize,
 		IdleTimeout:     time.Duration(pcw.IdleTimeout),
 		ReadBufferSize:  udpBufSize,
@@ -111,7 +120,7 @@ func (pcw *PacketConnWrapper) serve(ln hybrid.SplitListener) {
 			)
 			return
 		}
-		go pcw.handle(newPacketConn(sc))
+		go pcw.handle(newPacketConn(sc, true))
 	}
 }
 
