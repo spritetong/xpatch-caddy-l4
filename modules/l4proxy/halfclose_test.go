@@ -1,12 +1,17 @@
 package l4proxy
 
 import (
+	"context"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
+
+	"github.com/mholt/caddy-l4/layer4"
 )
 
 // waitHandle reports whether Handle returned within d.
@@ -154,5 +159,33 @@ func TestProvisionRejectsNegativeHalfCloseTimeout(t *testing.T) {
 	err := h.Provision(caddy.Context{})
 	if err == nil || !strings.Contains(err.Error(), "half_close_timeout") {
 		t.Fatalf("expected a half_close_timeout error, got %v", err)
+	}
+}
+
+func TestHandleUDPUpstreamEOFClosesDownstream(t *testing.T) {
+	// Custom mock upstream that immediately finishes reading
+	clientUp, serverUp := net.Pipe()
+	defer clientUp.Close()
+	_ = serverUp.Close() // Upstream has closed/finished
+
+	h := &Handler{logger: zap.NewNop(), ctx: caddy.Context{Context: context.Background()}}
+	h.LoadBalancing = &LoadBalancing{SelectionPolicy: &RandomSelection{}}
+
+	clientDown, serverDown := net.Pipe()
+	defer clientDown.Close()
+	// serverDown is NOT closeWriter, simulating UDP / packet conns
+	down := layer4.WrapConnection(serverDown, nil, h.logger)
+
+	done := make(chan error, 1)
+	go func() {
+		h.proxy(down, []net.Conn{clientUp})
+		done <- nil
+	}()
+
+	// Upstream is closed, clientDown is still open.
+	// Since downstream is UDP (not closeWriter), Handle MUST NOT hang on <-downConnClosedCh.
+	// It must close down and return promptly.
+	if !waitHandle(done, 2*time.Second) {
+		t.Fatal("proxy hung forever waiting for downstream after upstream closed!")
 	}
 }

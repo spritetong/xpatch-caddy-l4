@@ -515,12 +515,15 @@ func (h *Handler) proxy(down *layer4.Connection, upConns []net.Conn) {
 	wg.Wait()
 
 	// Shut down the writing side of the downstream connection, in case that
-	// the upstream connections are all half closed.
-	closeWrite(down.Conn)
-
-	// The upstreams have finished sending: do not wait for longer than the
-	// half-close timeout for a downstream that sends nothing.
-	downReader.arm()
+	// the upstream connections are all half closed. If downstream does not
+	// support half-close (e.g. UDP), close it immediately so reading stops.
+	if !closeWrite(down.Conn) {
+		_ = down.Close()
+	} else {
+		// The upstreams have finished sending: do not wait for longer than the
+		// half-close timeout for a downstream that sends nothing.
+		downReader.arm()
+	}
 
 	// Wait for reading from the downstream connection, if possible.
 	<-downConnClosedCh

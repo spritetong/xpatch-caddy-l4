@@ -103,6 +103,48 @@ func (s *Server) serve(ln net.Listener) error {
 	}
 }
 
+type resilientPacketConn struct {
+	net.PacketConn
+	logger *zap.Logger
+	closed atomic.Bool
+}
+
+func newResilientPacketConn(pc net.PacketConn, logger *zap.Logger) *resilientPacketConn {
+	return &resilientPacketConn{
+		PacketConn: pc,
+		logger:     logger,
+	}
+}
+
+func (r *resilientPacketConn) isClosed() bool {
+	return r.closed.Load()
+}
+
+func (r *resilientPacketConn) Close() error {
+	r.closed.Store(true)
+	return r.PacketConn.Close()
+}
+
+func (r *resilientPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	for {
+		n, addr, err = r.PacketConn.ReadFrom(b)
+		if err == nil || r.closed.Load() {
+			return n, addr, err
+		}
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+			r.closed.Store(true)
+			return n, addr, err
+		}
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			return n, addr, err
+		}
+		// Transient packet or ICMP errors on UDP sockets (e.g., ECONNREFUSED on Linux,
+		// WSAECONNRESET on Windows, ENOBUFS) must not kill the entire listener!
+		r.logger.Debug("transient UDP socket read error ignored", zap.Error(err))
+	}
+}
+
 func (s *Server) servePacket(pc net.PacketConn) error {
 	// The splitter sorts the packets of the socket into flows by downstream
 	// address:port, and serves each flow as a split connection until it's
@@ -112,31 +154,42 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 	// to be scheduled.
 	// The splitter never closes the socket, which Caddy may not expect closed
 	// more than once, while closing it makes the splitter stop on its own.
-	ln := hybrid.Split(hybrid.FakeClosePacketConn(pc, nil), &hybrid.SplitConfig{
-		AcceptQueueSize: udpAcceptQueueSize,
-		IdleTimeout:     time.Duration(s.IdleTimeout),
-		ReadBufferSize:  udpBufSize,
-		// Caddy closes the socket on every shutdown and reload, and a client
-		// gone makes a write fail, so these errors aren't worth an error log
-		ErrorFunc: func(err error) {
-			s.logger.Debug("packet connection error",
-				zap.String("network", pc.LocalAddr().Network()),
-				zap.String("address", pc.LocalAddr().String()),
-				zap.Error(err),
-			)
-		},
-	})
+	rpc := newResilientPacketConn(pc, s.logger)
 	for {
-		sc, err := ln.AcceptSplit()
-		if err != nil {
-			s.logger.Debug("packet connection drops",
-				zap.String("network", ln.Addr().Network()),
-				zap.String("address", ln.Addr().String()),
-				zap.Any("drops", ln.Stats()),
-			)
-			return err
+		ln := hybrid.Split(hybrid.FakeClosePacketConn(rpc, nil), &hybrid.SplitConfig{
+			AcceptQueueSize: udpAcceptQueueSize,
+			IdleTimeout:     time.Duration(s.IdleTimeout),
+			ReadBufferSize:  udpBufSize,
+			// Caddy closes the socket on every shutdown and reload, and a client
+			// gone makes a write fail, so these errors aren't worth an error log
+			ErrorFunc: func(err error) {
+				s.logger.Debug("packet connection error",
+					zap.String("network", pc.LocalAddr().Network()),
+					zap.String("address", pc.LocalAddr().String()),
+					zap.Error(err),
+				)
+			},
+		})
+		for {
+			sc, err := ln.AcceptSplit()
+			if err != nil {
+				s.logger.Debug("packet connection drops",
+					zap.String("network", ln.Addr().Network()),
+					zap.String("address", ln.Addr().String()),
+					zap.Any("drops", ln.Stats()),
+				)
+				if rpc.isClosed() || errors.Is(err, net.ErrClosed) {
+					return err
+				}
+				s.logger.Warn("packet connection splitter stopped unexpectedly, restarting",
+					zap.String("network", pc.LocalAddr().Network()),
+					zap.String("address", pc.LocalAddr().String()),
+					zap.Error(err),
+				)
+				break
+			}
+			go s.handle(newPacketConn(sc))
 		}
-		go s.handle(newPacketConn(sc))
 	}
 }
 
@@ -237,6 +290,7 @@ type packetConn struct {
 	// stores time.Time as Unix nanoseconds, or zero for no deadline, as Read may be
 	// called concurrently with SetReadDeadline
 	deadline      atomic.Int64
+	deadlineMu    sync.Mutex
 	deadlineTimer *time.Timer
 
 	// QUIC / TLS state tracking
@@ -348,15 +402,34 @@ func (pc *packetConn) SetDeadline(t time.Time) error {
 
 // SetReadDeadline sets the deadline to wait for data from the underlying net.PacketConn.
 func (pc *packetConn) SetReadDeadline(t time.Time) error {
+	pc.deadlineMu.Lock()
+	defer pc.deadlineMu.Unlock()
+
 	var ns int64
 	if !t.IsZero() {
 		ns = t.UnixNano()
 	}
 	pc.deadline.Store(ns)
+
 	if pc.deadlineTimer != nil {
-		pc.deadlineTimer.Reset(time.Until(t))
-	} else {
-		pc.deadlineTimer = time.NewTimer(time.Until(t))
+		if !pc.deadlineTimer.Stop() {
+			select {
+			case <-pc.deadlineTimer.C:
+			default:
+			}
+		}
+	}
+
+	if !t.IsZero() {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		if pc.deadlineTimer != nil {
+			pc.deadlineTimer.Reset(d)
+		} else {
+			pc.deadlineTimer = time.NewTimer(d)
+		}
 	}
 	return nil
 }
@@ -391,6 +464,13 @@ func (pc *packetConn) Read(b []byte) (n int, err error) {
 		return 0, os.ErrDeadlineExceeded
 	}
 	for {
+		var timerCh <-chan time.Time
+		pc.deadlineMu.Lock()
+		if pc.deadlineTimer != nil && pc.deadline.Load() != 0 {
+			timerCh = pc.deadlineTimer.C
+		}
+		pc.deadlineMu.Unlock()
+
 		select {
 		case pkt := <-pc.readCh:
 			if pkt == nil {
@@ -414,7 +494,7 @@ func (pc *packetConn) Read(b []byte) (n int, err error) {
 			}
 			pc.lastBufSize = pkt.n
 			return
-		case <-pc.deadlineTimer.C:
+		case <-timerCh:
 			// deadline may change during the wait, recheck
 			if pc.deadlineExceeded() {
 				return 0, os.ErrDeadlineExceeded
@@ -430,6 +510,12 @@ func (pc *packetConn) Write(b []byte) (n int, err error) {
 }
 
 func (pc *packetConn) Close() error {
+	pc.deadlineMu.Lock()
+	if pc.deadlineTimer != nil {
+		pc.deadlineTimer.Stop()
+	}
+	pc.deadlineMu.Unlock()
+
 	if pc.lastPacket != nil {
 		udpBufPool.Put(pc.lastPacket.pooledBuf)
 		pc.lastPacket = nil
