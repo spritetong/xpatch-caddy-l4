@@ -273,7 +273,6 @@ type packetConn struct {
 	// QUIC / TLS state tracking
 	initialDCID      []byte
 	firstInitialTime time.Time
-	hasData          atomic.Bool
 	writtenPackets   atomic.Uint64
 	released         atomic.Bool
 	// hasFallback reports whether the splitter can take over this flow. With a
@@ -289,12 +288,6 @@ const (
 	// quicVersion2 is RFC 9369. In v2 the Initial type bits are 0b01 rather
 	// than the 0b00 used by v1, so the first byte is 0xd0 instead of 0xc0.
 	quicVersion2 = uint32(0x6b3343cf)
-
-	// A QUIC client retransmits its Initial on a growing PTO. If nothing has
-	// been written back after this long, the flow is almost certainly
-	// misrouted or the upstream is dead, and a new Initial must re-enter
-	// matching instead of being fed to the stale handler.
-	quicStaleFlowSilentTimeout = 300 * time.Millisecond
 )
 
 // parseQUICInitialDCID parses the Destination Connection ID from a QUIC
@@ -357,20 +350,22 @@ func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 			// Check for new QUIC/TLS handshakes arriving on an existing session
 			pkt := buf[:n]
 			if len(pkt) > 0 {
-				if (pkt[0] & 0x80) == 0 {
-					// QUIC Short Header: 1-RTT application data packet
-					pc.hasData.Store(true)
-				} else if dcid, ok := parseQUICInitialDCID(pkt); ok {
+				if dcid, ok := parseQUICInitialDCID(pkt); ok {
 					if len(pc.initialDCID) == 0 {
 						pc.initialDCID = append([]byte(nil), dcid...)
 						pc.firstInitialTime = time.Now()
 					} else {
-						elapsed := time.Since(pc.firstInitialTime)
 						isDifferentDCID := !bytes.Equal(pc.initialDCID, dcid)
-						alreadyHasData := pc.hasData.Load()
-						upstreamSilent := pc.writtenPackets.Load() == 0 && elapsed > quicStaleFlowSilentTimeout
-
-						if isDifferentDCID || alreadyHasData || upstreamSilent {
+						// A different DCID alone does not mean a new connection:
+						// QUIC Retry and version negotiation make the client resend
+						// its Initial with a server-chosen DCID mid-handshake. Only
+						// treat it as a new handshake when the upstream has never
+						// answered this flow, which is the misrouting case this
+						// detection is meant to recover from. Ending a flow whose
+						// handshake is progressing strips its later packets into a
+						// new flow, where `not quic alpn ...` can route them to a
+						// different upstream and break the connection.
+						if isDifferentDCID && pc.writtenPackets.Load() == 0 {
 							// This flow is stale: the client started a new handshake on
 							// the same port. With a fallback, hand the whole flow over
 							// so the new Initial reaches the fallback proxy at once.
@@ -386,9 +381,10 @@ func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 						}
 					}
 				} else if isDTLSClientHello(pkt) {
-					if pc.hasData.Load() || (!pc.firstInitialTime.IsZero() &&
-						pc.writtenPackets.Load() == 0 &&
-						time.Since(pc.firstInitialTime) > quicStaleFlowSilentTimeout) {
+					// A cookie exchange makes the client repeat its ClientHello
+					// within one DTLS session. As with QUIC, only an unanswered
+					// flow can be a misrouted handshake worth restarting.
+					if !pc.firstInitialTime.IsZero() && pc.writtenPackets.Load() == 0 {
 						if pc.hasFallback {
 							pc.releaseToFallback(&packet{pooledBuf: buf, n: n})
 						} else {
@@ -397,7 +393,6 @@ func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 						}
 						return
 					}
-					pc.hasData.Store(true)
 					if pc.firstInitialTime.IsZero() {
 						pc.firstInitialTime = time.Now()
 					}

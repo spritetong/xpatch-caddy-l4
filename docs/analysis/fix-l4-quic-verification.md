@@ -265,4 +265,36 @@ BenchmarkParseInitialShort-12   1.40 ns/op    0 B/op    0 allocs/op
 
 新增的 `TestPacketConnWrapperStaleFlowReachesFallback` 先在旧 flow 上排入一个旧包，再发新 Initial，连续 5 次验证 fallback 总是先收到新 Initial，然后才收到旧包。
 
+---
+
+## 12. 现场反馈：启用 `not quic alpn h2c` 后 raw QUIC 只能接入一个连接
+
+### 现象与复现
+
+现场配置在第一条路由加上 `not quic alpn h2c` + PROXY protocol v2 后：h3 正常，raw QUIC 只有一台能连；注释掉该路由后多台设备都能接入。用两个 ALPN 均为 `[h3, h2c]` 的 quic-go 客户端复现（`integration/quic_repro_test.go`），debug 日志显示：
+
+1. 第一条流正确匹配第二条路由，dial `udp/<raw-quic-upstream>`；
+2. 约 2 ms 后旧 handler 结束（`written=2`，上游已回包）；
+3. 同一客户端端口立刻产生第二条流，这次 quic matcher 返回 false，`not` 命中第一条路由，包被转发到 PROXY protocol 的 h3 upstream，连接失败。
+
+两个客户端都如此，因此看起来像“只允许一个连接”，实际是**每条连接在握手中被切成两条流，后一条被错误路由**。
+
+### 根因
+
+`newPacketConn` 的 stale-flow 检测把“同一连接握手中的 DCID 变化”当成新会话：QUIC Retry / 版本协商会让客户端在握手中途用服务端选定的新 DCID 重发 Initial。原条件 `isDifferentDCID || alreadyHasData || upstreamSilent` 中，只要 DCID 不同就结束当前 flow；而此时上游已经回应（Retry 本身就是上游回包），属于健康握手。flow 结束后客户端后续包形成新 flow，首包已不是 Initial，`not quic alpn h2c` 命中，被送到错误的 upstream。DTLS 分支同样会在 Cookie 交换的第二个 ClientHello 上误杀。
+
+### 修复
+
+`layer4/server.go`：
+
+- QUIC：只有 **DCID 变化且该 flow 从未收到任何上游回包**（`writtenPackets == 0`）才判定为误匹配、结束/移交 flow。上游已有回包说明握手在推进，DCID 变化按同一连接处理。
+- DTLS：同样只在没有上游回包时把重复的 ClientHello 判定为新握手。
+- 删除不再需要的 `hasData` 状态、300ms `upstreamSilent` 启发式和短头包嗅探分支。
+
+原“首个 Initial 匹配错、上游无回应”的恢复行为由 `TestServePacketNewQUICInitialResetsFlow` 覆盖，仍成立；新增 `TestServePacketDCIDChangeWithLiveUpstreamKeepsFlow` 和 `TestQUICRouteSurvivesDCIDChange` 覆盖本 bug。
+
+### 验证
+
+`go test ./...`、`go vet` 全部通过；复现测试中两个客户端均拿到 `echo:client-1` / `echo:client-2`。
+
 

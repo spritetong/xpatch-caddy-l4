@@ -710,6 +710,51 @@ func TestServePacketNewQUICInitialResetsFlow(t *testing.T) {
 	}, func() string { return "second handler to start" })
 }
 
+// QUIC Retry and version negotiation make a client resend its Initial with a
+// different DCID while its handshake is alive. Such a packet must not end a
+// flow whose upstream is already answering, or the following packets form a
+// new flow that can take a different route.
+func TestServePacketDCIDChangeWithLiveUpstreamKeepsFlow(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstDone)
+				}
+				return nil
+			}
+			_, _ = cx.Write([]byte("handshake-progress"))
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+	if _, err := c.Write(makeDummyQUICInitial([]byte("OLD"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	if _, err := c.Write(makeDummyQUICInitial([]byte("NEW-DCID"))); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstDone:
+		t.Fatal("live flow was reset by a Retry-style DCID change")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := handlerCount.Load(); got != 1 {
+		t.Fatalf("handler count = %d, want 1", got)
+	}
+}
+
 type oneShotWriteClosedPacketConn struct {
 	net.PacketConn
 	arm  atomic.Bool
