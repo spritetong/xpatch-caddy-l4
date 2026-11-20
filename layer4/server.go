@@ -238,6 +238,38 @@ type packetConn struct {
 	// called concurrently with SetReadDeadline
 	deadline      atomic.Int64
 	deadlineTimer *time.Timer
+
+	// QUIC / TLS state tracking
+	initialDCID      []byte
+	firstInitialTime time.Time
+	hasData          atomic.Bool
+	writtenPackets   atomic.Uint64
+}
+
+// parseQUICInitialDCID parses the Destination Connection ID from a QUIC Initial packet (RFC 9000).
+func parseQUICInitialDCID(b []byte) ([]byte, bool) {
+	if len(b) < 1200 {
+		return nil, false
+	}
+	// Long Header Form (0x80) + Fixed Bit (0x40) + Packet Type Initial (0x00) -> 0xC0
+	if (b[0] & 0xf0) != 0xc0 {
+		return nil, false
+	}
+	// Version must not be 0 (Version Negotiation is sent by server, not client)
+	if b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0 {
+		return nil, false
+	}
+	dcidLen := int(b[5])
+	if dcidLen > 20 || 6+dcidLen > len(b) {
+		return nil, false
+	}
+	return b[6 : 6+dcidLen], true
+}
+
+// isDTLSClientHello checks if a packet looks like a DTLS ClientHello.
+func isDTLSClientHello(b []byte) bool {
+	// ContentType == Handshake (22), ProtocolVersion == DTLS 1.x (0xfe..), HandshakeType == ClientHello (1)
+	return len(b) > 13 && b[0] == 22 && b[1] == 0xfe && b[13] == 1
 }
 
 // newPacketConn returns a packetConn serving the flow of sc. Its goroutine
@@ -258,6 +290,45 @@ func newPacketConn(sc hybrid.SplitConn) *packetConn {
 				udpBufPool.Put(buf)
 				return
 			}
+
+			// Check for new QUIC/TLS handshakes arriving on an existing session
+			pkt := buf[:n]
+			if len(pkt) > 0 {
+				if (pkt[0] & 0x80) == 0 {
+					// QUIC Short Header: 1-RTT application data packet
+					pc.hasData.Store(true)
+				} else if dcid, ok := parseQUICInitialDCID(pkt); ok {
+					if len(pc.initialDCID) == 0 {
+						pc.initialDCID = append([]byte(nil), dcid...)
+						pc.firstInitialTime = time.Now()
+					} else {
+						isDifferentDCID := !bytes.Equal(pc.initialDCID, dcid)
+						alreadyHasData := pc.hasData.Load()
+						retransmitAfterDelay := time.Since(pc.firstInitialTime) > 800*time.Millisecond
+						upstreamSilent := pc.writtenPackets.Load() == 0 && time.Since(pc.firstInitialTime) > 300*time.Millisecond
+
+						if isDifferentDCID || alreadyHasData || upstreamSilent || retransmitAfterDelay {
+							// Client started a new handshake on the same client port or is recovering
+							// from a failed/misrouted handshake. Terminate this stale flow immediately
+							// so that hybrid.Split and downstream handlers release their state.
+							_ = pc.PacketConn.Close()
+							udpBufPool.Put(buf)
+							return
+						}
+					}
+				} else if isDTLSClientHello(pkt) {
+					if pc.hasData.Load() || (pc.writtenPackets.Load() == 0 && !pc.firstInitialTime.IsZero() && time.Since(pc.firstInitialTime) > 300*time.Millisecond) {
+						_ = pc.PacketConn.Close()
+						udpBufPool.Put(buf)
+						return
+					}
+					pc.hasData.Store(true)
+					if pc.firstInitialTime.IsZero() {
+						pc.firstInitialTime = time.Now()
+					}
+				}
+			}
+
 			pc.readCh <- &packet{
 				pooledBuf: buf,
 				n:         n,
@@ -354,6 +425,7 @@ func (pc *packetConn) Read(b []byte) (n int, err error) {
 }
 
 func (pc *packetConn) Write(b []byte) (n int, err error) {
+	pc.writtenPackets.Add(1)
 	return pc.WriteTo(b, pc.addr)
 }
 

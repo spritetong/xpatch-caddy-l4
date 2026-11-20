@@ -438,9 +438,11 @@ const (
 	quicVersionReplKey       = quicReplPrefix + "version"
 )
 
-const (
-	QUICAcceptTimeout = 100 * time.Millisecond
+var (
+	QUICAcceptTimeout = 1 * time.Second
+)
 
+const (
 	QUICCertificateCommonName     = "layer4"
 	QUICCertificateOrganization   = "caddy"
 	QUICCertificateSubjectAltName = "*"

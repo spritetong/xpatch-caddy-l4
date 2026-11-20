@@ -634,3 +634,78 @@ func TestServePacketSetDeadline(t *testing.T) {
 		t.Fatalf("got reply %q, want %q", got, "second")
 	}
 }
+
+func makeDummyQUICInitial(dcid []byte) []byte {
+	pkt := make([]byte, 1200)
+	pkt[0] = 0xc0 // Long Header Initial
+	pkt[1] = 0x00
+	pkt[2] = 0x00
+	pkt[3] = 0x00
+	pkt[4] = 0x01 // Version 1
+	pkt[5] = byte(len(dcid))
+	copy(pkt[6:], dcid)
+	return pkt
+}
+
+func TestServePacketNewQUICInitialResetsFlow(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstHandlerDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstHandlerDone)
+				}
+				return nil
+			}
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+
+	// 1. Send first Initial packet (DCID: AAAA)
+	p1 := makeDummyQUICInitial([]byte("AAAA"))
+	if _, err := c.Write(p1); err != nil {
+		t.Fatalf("write p1: %v", err)
+	}
+
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	// 2. Send 1-RTT packet (Short Header: byte 0 has MSB 0)
+	shortPkt := []byte{0x40, 0x01, 0x02}
+	if _, err := c.Write(shortPkt); err != nil {
+		t.Fatalf("write short: %v", err)
+	}
+
+	// 3. Send new Initial packet with DIFFERENT DCID (DCID: BBBB)
+	// This simulates client starting a new QUIC handshake / session on the same port.
+	p2 := makeDummyQUICInitial([]byte("BBBB"))
+	if _, err := c.Write(p2); err != nil {
+		t.Fatalf("write p2: %v", err)
+	}
+
+	// First handler MUST terminate due to new Initial packet!
+	select {
+	case <-firstHandlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handler did not terminate upon receiving new QUIC Initial packet")
+	}
+
+	// 4. Client retransmits / sends subsequent packet for the new handshake
+	if _, err := c.Write(p2); err != nil {
+		t.Fatalf("write p2 retry: %v", err)
+	}
+
+	// Second handler MUST start!
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 2
+	}, func() string { return "second handler to start" })
+}
+

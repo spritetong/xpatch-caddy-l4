@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
@@ -132,6 +133,9 @@ func Test_MatchQUIC_Match(t *testing.T) {
 // only qContext exit path is DeadlineExceeded.
 func Test_MatchQUIC_DeadlineReturnsNotMatched(t *testing.T) {
 	isTesting = true
+	oldTimeout := QUICAcceptTimeout
+	QUICAcceptTimeout = 100 * time.Millisecond
+	defer func() { QUICAcceptTimeout = oldTimeout }()
 	m := &MatchQUIC{}
 
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
