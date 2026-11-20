@@ -160,3 +160,106 @@ func TestQUICRouteSurvivesDCIDChange(t *testing.T) {
 		}
 	}
 }
+
+// TestQUICRouteConcurrentLiveClients verifies that multiple QUIC clients can
+// connect and stay connected simultaneously without breaking each other.
+func TestQUICRouteConcurrentLiveClients(t *testing.T) {
+	wrong, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrong.Close()
+	go func() {
+		buf := make([]byte, 9000)
+		for {
+			if _, _, err := wrong.ReadFrom(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	freePort := func() string {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := pc.LocalAddr().String()
+		_ = pc.Close()
+		return addr
+	}
+	upAddr := freePort()
+	startQUICUpstream(t, upAddr)
+	l4Addr := freePort()
+
+	cfg := fmt.Sprintf(`{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"quic-dispatch": {
+					"listen": ["udp/%s"],
+					"routes": [
+						{
+							"match": [{"not": [{"quic": {"alpn": ["h2c"]}}]}],
+							"handle": [{"handler": "proxy", "proxy_protocol": "v2", "upstreams": [{"dial": ["udp/%s"]}]}]
+						},
+						{
+							"handle": [{"handler": "proxy", "upstreams": [{"dial": ["udp/%s"]}]}]
+						}
+					]
+				}
+			}
+		}
+	}
+}`, l4Addr, wrong.LocalAddr().String(), upAddr)
+
+	loadCaddyWithJSON(t, []byte(cfg))
+	defer stopCaddy(t)
+
+	const clientCount = 5
+	type clientState struct {
+		conn   *quic.Conn
+		stream *quic.Stream
+	}
+	clients := make([]clientState, clientCount)
+
+	// Step 1: Connect all clients concurrently without closing them
+	for i := 0; i < clientCount; i++ {
+		id := fmt.Sprintf("client-%d", i+1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h3", "h2c"},
+		}, &quic.Config{})
+		cancel()
+		if err != nil {
+			t.Fatalf("%s dial: %v", id, err)
+		}
+		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, err := conn.OpenStreamSync(ctx2)
+		cancel2()
+		if err != nil {
+			_ = conn.CloseWithError(0, "")
+			t.Fatalf("%s open stream: %v", id, err)
+		}
+		clients[i] = clientState{conn: conn, stream: stream}
+		t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	}
+
+	// Step 2: All clients send data and verify response while all are still alive
+	for i := 0; i < clientCount; i++ {
+		id := fmt.Sprintf("client-%d", i+1)
+		stream := clients[i].stream
+		if _, err := stream.Write([]byte(id)); err != nil {
+			t.Fatalf("%s write: %v", id, err)
+		}
+		buf := make([]byte, 64)
+		_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := stream.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Fatalf("%s read: %v", id, err)
+		}
+		if got, want := string(buf[:n]), "echo:"+id; got != want {
+			t.Fatalf("%s response = %q, want %q", id, got, want)
+		}
+	}
+}

@@ -271,10 +271,10 @@ type packetConn struct {
 	deadlineTimer *time.Timer
 
 	// QUIC / TLS state tracking
-	initialDCID      []byte
-	firstInitialTime time.Time
-	writtenPackets   atomic.Uint64
-	released         atomic.Bool
+	initialDCID       []byte
+	initialDTLSRandom []byte
+	writtenPackets    atomic.Uint64
+	released          atomic.Bool
 	// hasFallback reports whether the splitter can take over this flow. With a
 	// fallback, a stale flow is handed over; without one, it is ended so the
 	// next packet re-enters matching immediately.
@@ -321,10 +321,33 @@ func parseQUICInitialDCID(b []byte) ([]byte, bool) {
 	return b[6 : 6+dcidLen], true
 }
 
+// parseDTLSClientHelloRandom extracts the 32-byte Client Random from a DTLS
+// ClientHello record (RFC 6347 §4.2.4.1 / RFC 5246 §7.4.1.2).
+func parseDTLSClientHelloRandom(b []byte) ([]byte, bool) {
+	// DTLS record header (13 bytes):
+	// b[0] = 22 (handshake)
+	// b[1] = 0xfe (DTLS 1.x / DTLS 1.3)
+	// Handshake header (12 bytes):
+	// b[13] = 1 (ClientHello)
+	// b[19..21] = fragment_offset (uint24, must be 0 for the initial fragment)
+	// ClientHello body:
+	// b[25..26] = client_version (2 bytes)
+	// b[27..58] = random (32 bytes)
+	//
+	// Minimum length for a record containing Client Random is 27 + 32 = 59 bytes.
+	if len(b) < 59 || b[0] != 22 || b[1] != 0xfe || b[13] != 1 {
+		return nil, false
+	}
+	if b[19] != 0 || b[20] != 0 || b[21] != 0 {
+		return nil, false
+	}
+	return b[27:59], true
+}
+
 // isDTLSClientHello checks if a packet looks like a DTLS ClientHello.
 func isDTLSClientHello(b []byte) bool {
-	// ContentType == Handshake (22), ProtocolVersion == DTLS 1.x (0xfe..), HandshakeType == ClientHello (1)
-	return len(b) > 13 && b[0] == 22 && b[1] == 0xfe && b[13] == 1
+	_, ok := parseDTLSClientHelloRandom(b)
+	return ok
 }
 
 // newPacketConn returns a packetConn serving the flow of sc. Its goroutine
@@ -353,7 +376,6 @@ func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 				if dcid, ok := parseQUICInitialDCID(pkt); ok {
 					if len(pc.initialDCID) == 0 {
 						pc.initialDCID = append([]byte(nil), dcid...)
-						pc.firstInitialTime = time.Now()
 					} else {
 						isDifferentDCID := !bytes.Equal(pc.initialDCID, dcid)
 						// A different DCID alone does not mean a new connection:
@@ -380,21 +402,25 @@ func newPacketConn(sc hybrid.SplitConn, hasFallback bool) *packetConn {
 							return
 						}
 					}
-				} else if isDTLSClientHello(pkt) {
-					// A cookie exchange makes the client repeat its ClientHello
-					// within one DTLS session. As with QUIC, only an unanswered
-					// flow can be a misrouted handshake worth restarting.
-					if !pc.firstInitialTime.IsZero() && pc.writtenPackets.Load() == 0 {
-						if pc.hasFallback {
-							pc.releaseToFallback(&packet{pooledBuf: buf, n: n})
-						} else {
-							_ = pc.PacketConn.Close()
-							udpBufPool.Put(buf)
+				} else if random, ok := parseDTLSClientHelloRandom(pkt); ok {
+					if len(pc.initialDTLSRandom) == 0 {
+						pc.initialDTLSRandom = append([]byte(nil), random...)
+					} else {
+						isDifferentRandom := !bytes.Equal(pc.initialDTLSRandom, random)
+						// In DTLS (RFC 6347 §4.2.1), both retransmissions and the
+						// second ClientHello of a cookie exchange MUST use the same
+						// Client Random as the initial ClientHello. Only a different
+						// Random on an unanswered flow indicates a newly started
+						// handshake that should be reset.
+						if isDifferentRandom && pc.writtenPackets.Load() == 0 {
+							if pc.hasFallback {
+								pc.releaseToFallback(&packet{pooledBuf: buf, n: n})
+							} else {
+								_ = pc.PacketConn.Close()
+								udpBufPool.Put(buf)
+							}
+							return
 						}
-						return
-					}
-					if pc.firstInitialTime.IsZero() {
-						pc.firstInitialTime = time.Now()
 					}
 				}
 			}

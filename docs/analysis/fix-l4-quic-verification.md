@@ -297,4 +297,35 @@ BenchmarkParseInitialShort-12   1.40 ns/op    0 B/op    0 allocs/op
 
 `go test ./...`、`go vet` 全部通过；复现测试中两个客户端均拿到 `echo:client-1` / `echo:client-2`。
 
+---
+
+## 13. DTLS ClientHello 校验精度强化：引入 Client Random 检测
+
+### 背景与隐患
+
+提交 `ba28200` 虽修复了 QUIC 的 DCID 误杀，但 DTLS 分支此前只检查 `!pc.firstInitialTime.IsZero() && pc.writtenPackets.Load() == 0`。
+若客户端因网络延迟或丢包在 1 秒内重传同一个 ClientHello（此时慢速上游尚未回包），该重传会被误判为“新握手”而强行中断 flow 并丢包。
+
+### 修复方案
+
+依据 RFC 6347 §4.2.1（DTLS 1.2）及 RFC 5246 §7.4.1.2：
+- 无论是丢包引起的 ClientHello 重传，还是 Cookie 交换（收到 HelloVerifyRequest 后的第二个 ClientHello），客户端**必须保持相同的 Client Random（32 字节）**。
+- 只有发起**全新**的 DTLS 会话时，客户端才会生成新的随机数（`Random`）。
+
+实现改动（`layer4/server.go`）：
+1. 新增 `parseDTLSClientHelloRandom`：安全解析 DTLS 记录与握手头，提取 32 字节的 Client Random；非首分片（`fragment_offset != 0`）或长度不足 59 字节安全返回 false。
+2. `packetConn` 维护 `initialDTLSRandom []byte`：首包记录客户端 Random；仅当后续 ClientHello 的 **Random 发生改变且上游从未回包**（`isDifferentRandom && writtenPackets == 0`）时才进行流重置。
+3. 移除了无用的 `firstInitialTime` 字段，精简内存与时间系统调用开销。
+
+### 验证
+
+新增 4 个针对性单元测试与 1 个集成测试：
+- `TestParseDTLSClientHelloRandom`：DTLS 1.0/1.2/1.3 解析、分片包拦截、截断包拦截、非 Handshake / 非 DTLS 记录拦截；
+- `TestServePacketDTLSRetransmitKeepsFlow`：上游未回复时的 ClientHello 重传保持 flow，不误杀；
+- `TestServePacketDTLSNewSessionResetsFlow`：Random 改变的新 DTLS 会话触发流重置与新 handler 启动；
+- `TestServePacketDTLSLiveUpstreamKeepsFlow`：上游已有回包时，后续 ClientHello 不中断活跃连接；
+- `TestQUICRouteConcurrentLiveClients`：5 个并发保持在线的 QUIC 客户端同时验证，互不干扰。
+
+全部测试通过（`go test ./...`）。
+
 

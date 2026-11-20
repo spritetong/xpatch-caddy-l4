@@ -910,3 +910,218 @@ func TestServePacketLiveHandshakeSurvivesLateRetransmit(t *testing.T) {
 		t.Fatalf("handler count = %d, want 1", got)
 	}
 }
+
+func makeDummyDTLSClientHello(random []byte) []byte {
+	pkt := make([]byte, 80)
+	pkt[0] = 22    // ContentType = Handshake
+	pkt[1] = 0xfe  // DTLS major version
+	pkt[2] = 0xfd  // DTLS 1.2
+	pkt[11] = 0    // record length MSB
+	pkt[12] = 67   // record length LSB (80 - 13)
+	pkt[13] = 1    // HandshakeType = ClientHello
+	pkt[14] = 0    // handshake length uint24
+	pkt[15] = 0
+	pkt[16] = 55   // 67 - 12
+	// message_seq 17..18 = 0
+	// fragment_offset 19..21 = 0
+	// fragment_length 22..24 = 55
+	pkt[24] = 55
+	pkt[25] = 0xfe // ClientVersion major
+	pkt[26] = 0xfd // ClientVersion minor
+	copy(pkt[27:59], random)
+	return pkt
+}
+
+func TestParseDTLSClientHelloRandom(t *testing.T) {
+	rand1 := []byte("12345678901234567890123456789012") // 32 bytes
+	pkt := makeDummyDTLSClientHello(rand1)
+
+	got, ok := parseDTLSClientHelloRandom(pkt)
+	if !ok || !bytes.Equal(got, rand1) {
+		t.Fatalf("parseDTLSClientHelloRandom: got %q, %v", got, ok)
+	}
+
+	// Fragmented handshake (fragment_offset != 0) must be rejected
+	frag := bytes.Clone(pkt)
+	frag[21] = 1
+	if _, ok := parseDTLSClientHelloRandom(frag); ok {
+		t.Fatal("accepted fragmented ClientHello")
+	}
+
+	// Too short (< 59 bytes)
+	if _, ok := parseDTLSClientHelloRandom(pkt[:58]); ok {
+		t.Fatal("accepted truncated ClientHello")
+	}
+
+	// Non-handshake record type
+	nonHandshake := bytes.Clone(pkt)
+	nonHandshake[0] = 23 // ApplicationData
+	if _, ok := parseDTLSClientHelloRandom(nonHandshake); ok {
+		t.Fatal("accepted non-handshake record")
+	}
+
+	// Non-DTLS record version (e.g. TLS 0x03 0x03)
+	tlsPkt := bytes.Clone(pkt)
+	tlsPkt[1] = 0x03
+	tlsPkt[2] = 0x03
+	if _, ok := parseDTLSClientHelloRandom(tlsPkt); ok {
+		t.Fatal("accepted TLS record as DTLS")
+	}
+
+	// Handshake type other than ClientHello
+	serverHello := bytes.Clone(pkt)
+	serverHello[13] = 2
+	if _, ok := parseDTLSClientHelloRandom(serverHello); ok {
+		t.Fatal("accepted ServerHello as ClientHello")
+	}
+}
+
+// Retransmissions of DTLS ClientHello (same Random) while the upstream has not
+// answered yet must not reset the flow.
+func TestServePacketDTLSRetransmitKeepsFlow(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstDone)
+				}
+				return nil
+			}
+			// simulate slow upstream: do NOT write back immediately
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+	rand1 := []byte("DTLS-RANDOM-SESSION-000000000001")
+	p1 := makeDummyDTLSClientHello(rand1)
+
+	if _, err := c.Write(p1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	// Retransmit identical ClientHello with same Random (silent upstream)
+	if _, err := c.Write(p1); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-firstDone:
+		t.Fatal("live DTLS flow was terminated by a ClientHello retransmission")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := handlerCount.Load(); got != 1 {
+		t.Fatalf("handler count = %d, want 1", got)
+	}
+}
+
+// A new DTLS ClientHello with a DIFFERENT Random arriving on an unanswered
+// flow indicates a newly started session that should reset the stale flow.
+func TestServePacketDTLSNewSessionResetsFlow(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstHandlerDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstHandlerDone)
+				}
+				return nil
+			}
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+
+	rand1 := []byte("DTLS-RANDOM-SESSION-000000000001")
+	p1 := makeDummyDTLSClientHello(rand1)
+	if _, err := c.Write(p1); err != nil {
+		t.Fatalf("write p1: %v", err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	// Send new ClientHello with DIFFERENT Random (session 2 on same port)
+	rand2 := []byte("DTLS-RANDOM-SESSION-000000000002")
+	p2 := makeDummyDTLSClientHello(rand2)
+	if _, err := c.Write(p2); err != nil {
+		t.Fatalf("write p2: %v", err)
+	}
+
+	select {
+	case <-firstHandlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first handler did not terminate upon receiving new DTLS session")
+	}
+
+	// Trigger second handler with retransmit
+	if _, err := c.Write(p2); err != nil {
+		t.Fatalf("write p2 retransmit: %v", err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 2
+	}, func() string { return "second handler to start" })
+}
+
+// A DTLS flow whose upstream is answering must not be ended by subsequent
+// ClientHellos (such as cookie exchange).
+func TestServePacketDTLSLiveUpstreamKeepsFlow(t *testing.T) {
+	var handlerCount atomic.Int32
+	firstDone := make(chan struct{})
+
+	addr := startPacketServer(t, HandlerFunc(func(cx *Connection) error {
+		cnt := handlerCount.Add(1)
+		_ = cx.SetReadDeadline(time.Time{})
+		buf := make([]byte, 1500)
+		for {
+			_, err := cx.Read(buf)
+			if err != nil {
+				if cnt == 1 {
+					close(firstDone)
+				}
+				return nil
+			}
+			_, _ = cx.Write([]byte("dtls-upstream-progress"))
+		}
+	}), 30*time.Second)
+
+	c := dialPacketServer(t, addr)
+	rand1 := []byte("DTLS-RANDOM-SESSION-000000000001")
+	p1 := makeDummyDTLSClientHello(rand1)
+	if _, err := c.Write(p1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return handlerCount.Load() == 1
+	}, func() string { return "first handler to start" })
+
+	// Client sends second packet with different random after upstream progress
+	rand2 := []byte("DTLS-RANDOM-SESSION-000000000002")
+	p2 := makeDummyDTLSClientHello(rand2)
+	if _, err := c.Write(p2); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstDone:
+		t.Fatal("live DTLS flow was terminated despite upstream answering")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if got := handlerCount.Load(); got != 1 {
+		t.Fatalf("handler count = %d, want 1", got)
+	}
+}
