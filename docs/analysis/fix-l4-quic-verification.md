@@ -324,8 +324,21 @@ BenchmarkParseInitialShort-12   1.40 ns/op    0 B/op    0 allocs/op
 - `TestServePacketDTLSRetransmitKeepsFlow`：上游未回复时的 ClientHello 重传保持 flow，不误杀；
 - `TestServePacketDTLSNewSessionResetsFlow`：Random 改变的新 DTLS 会话触发流重置与新 handler 启动；
 - `TestServePacketDTLSLiveUpstreamKeepsFlow`：上游已有回包时，后续 ClientHello 不中断活跃连接；
-- `TestQUICRouteConcurrentLiveClients`：5 个并发保持在线的 QUIC 客户端同时验证，互不干扰。
+- `TestQUICRouteConcurrentLiveClients`：5 个客户端并发建连、并发收发，互不干扰。
 
 全部测试通过（`go test ./...`）。
+
+### 审计修正
+
+对 `6e9cb39` 的审计发现并修正了以下问题：
+
+- 删除已无调用者的 `isDTLSClientHello`（`unused` linter 报错，CI 会失败）。
+- `layer4/server.go` 的 `SetReadDeadline` 用内置 `max` 取代手写 `if d < 0`（`modernize` linter 报错）。
+- `parseDTLSClientHelloRandom` 增加记录长度与 fragment_length 校验：`fragment_offset==0` 但首片不足以容纳 Random 的包、声明长度超过数据报的包都不再被误判，避免把后续记录的字节当成 Random。
+- 单元测试补充 DTLS 1.0/1.2（DTLS 1.3 在线路上同样使用 `0xfefd`）以及短首片、非法记录长度用例。
+- 集成测试改为真正并发：5 个客户端同时建连、同时收发，各自校验回包。
+- 修正 `layer4/server_udp_test.go` 的 gofmt 格式。
+
+验证：`go test ./... -count=1`、`go vet ./...`、`git diff --check`、`gofmt -l`、`golangci-lint run ./layer4/...` 全部无问题。
 
 

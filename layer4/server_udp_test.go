@@ -913,15 +913,15 @@ func TestServePacketLiveHandshakeSurvivesLateRetransmit(t *testing.T) {
 
 func makeDummyDTLSClientHello(random []byte) []byte {
 	pkt := make([]byte, 80)
-	pkt[0] = 22    // ContentType = Handshake
-	pkt[1] = 0xfe  // DTLS major version
-	pkt[2] = 0xfd  // DTLS 1.2
-	pkt[11] = 0    // record length MSB
-	pkt[12] = 67   // record length LSB (80 - 13)
-	pkt[13] = 1    // HandshakeType = ClientHello
-	pkt[14] = 0    // handshake length uint24
+	pkt[0] = 22   // ContentType = Handshake
+	pkt[1] = 0xfe // DTLS major version
+	pkt[2] = 0xfd // DTLS 1.2
+	pkt[11] = 0   // record length MSB
+	pkt[12] = 67  // record length LSB (80 - 13)
+	pkt[13] = 1   // HandshakeType = ClientHello
+	pkt[14] = 0   // handshake length uint24
 	pkt[15] = 0
-	pkt[16] = 55   // 67 - 12
+	pkt[16] = 55 // 67 - 12
 	// message_seq 17..18 = 0
 	// fragment_offset 19..21 = 0
 	// fragment_length 22..24 = 55
@@ -941,11 +941,41 @@ func TestParseDTLSClientHelloRandom(t *testing.T) {
 		t.Fatalf("parseDTLSClientHelloRandom: got %q, %v", got, ok)
 	}
 
+	// DTLS 1.0 (0xfeff), 1.2 (0xfefd) and 1.3 (also 0xfefd on the wire, with
+	// the legacy_version field) all share the 0xfe major version byte.
+	for _, minor := range []byte{0xff, 0xfd} {
+		version := bytes.Clone(pkt)
+		version[2] = minor
+		got, ok := parseDTLSClientHelloRandom(version)
+		if !ok || !bytes.Equal(got, rand1) {
+			t.Fatalf("DTLS minor %#x: got %q, %v", minor, got, ok)
+		}
+	}
+
 	// Fragmented handshake (fragment_offset != 0) must be rejected
 	frag := bytes.Clone(pkt)
 	frag[21] = 1
 	if _, ok := parseDTLSClientHelloRandom(frag); ok {
 		t.Fatal("accepted fragmented ClientHello")
+	}
+
+	// First fragment too short to carry the full Random
+	shortFrag := bytes.Clone(pkt)
+	shortFrag[24] = 10
+	if _, ok := parseDTLSClientHelloRandom(shortFrag); ok {
+		t.Fatal("accepted ClientHello with a short first fragment")
+	}
+
+	// Record length inconsistent with the datagram
+	badLen := bytes.Clone(pkt)
+	badLen[12] = 200
+	if _, ok := parseDTLSClientHelloRandom(badLen); ok {
+		t.Fatal("accepted ClientHello with an overlong record length")
+	}
+	badLen = bytes.Clone(pkt)
+	badLen[12] = 20
+	if _, ok := parseDTLSClientHelloRandom(badLen); ok {
+		t.Fatal("accepted ClientHello with a record shorter than the Random")
 	}
 
 	// Too short (< 59 bytes)

@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,44 +223,79 @@ func TestQUICRouteConcurrentLiveClients(t *testing.T) {
 	}
 	clients := make([]clientState, clientCount)
 
-	// Step 1: Connect all clients concurrently without closing them
+	// Step 1: dial and open a stream on all clients at the same time.
+	dialErr := make(chan error, clientCount)
+	var dialWG sync.WaitGroup
 	for i := 0; i < clientCount; i++ {
-		id := fmt.Sprintf("client-%d", i+1)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"h3", "h2c"},
-		}, &quic.Config{})
-		cancel()
-		if err != nil {
-			t.Fatalf("%s dial: %v", id, err)
+		i := i
+		dialWG.Add(1)
+		go func() {
+			defer dialWG.Done()
+			id := fmt.Sprintf("client-%d", i+1)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h3", "h2c"},
+			}, &quic.Config{})
+			if err != nil {
+				dialErr <- fmt.Errorf("%s dial: %w", id, err)
+				return
+			}
+			stream, err := conn.OpenStreamSync(ctx)
+			if err != nil {
+				_ = conn.CloseWithError(0, "")
+				dialErr <- fmt.Errorf("%s open stream: %w", id, err)
+				return
+			}
+			clients[i] = clientState{conn: conn, stream: stream}
+		}()
+	}
+	dialWG.Wait()
+	for i := range clients {
+		if clients[i].conn != nil {
+			conn := clients[i].conn
+			t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
 		}
-		ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-		stream, err := conn.OpenStreamSync(ctx2)
-		cancel2()
-		if err != nil {
-			_ = conn.CloseWithError(0, "")
-			t.Fatalf("%s open stream: %v", id, err)
-		}
-		clients[i] = clientState{conn: conn, stream: stream}
-		t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	}
+	close(dialErr)
+	for err := range dialErr {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
 	}
 
-	// Step 2: All clients send data and verify response while all are still alive
+	// Step 2: all clients transmit concurrently, while every connection is
+	// still live, and each response must come back on its own stream.
+	exchangeErr := make(chan error, clientCount)
+	var exchangeWG sync.WaitGroup
 	for i := 0; i < clientCount; i++ {
-		id := fmt.Sprintf("client-%d", i+1)
-		stream := clients[i].stream
-		if _, err := stream.Write([]byte(id)); err != nil {
-			t.Fatalf("%s write: %v", id, err)
-		}
-		buf := make([]byte, 64)
-		_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, err := stream.Read(buf)
-		if err != nil && err != io.EOF {
-			t.Fatalf("%s read: %v", id, err)
-		}
-		if got, want := string(buf[:n]), "echo:"+id; got != want {
-			t.Fatalf("%s response = %q, want %q", id, got, want)
-		}
+		i := i
+		exchangeWG.Add(1)
+		go func() {
+			defer exchangeWG.Done()
+			id := fmt.Sprintf("client-%d", i+1)
+			stream := clients[i].stream
+			if _, err := stream.Write([]byte(id)); err != nil {
+				exchangeErr <- fmt.Errorf("%s write: %w", id, err)
+				return
+			}
+			buf := make([]byte, 64)
+			_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, err := stream.Read(buf)
+			if err != nil && err != io.EOF {
+				exchangeErr <- fmt.Errorf("%s read: %w", id, err)
+				return
+			}
+			if got, want := string(buf[:n]), "echo:"+id; got != want {
+				exchangeErr <- fmt.Errorf("%s response = %q, want %q", id, got, want)
+			}
+		}()
+	}
+	exchangeWG.Wait()
+	close(exchangeErr)
+	for err := range exchangeErr {
+		t.Error(err)
 	}
 }

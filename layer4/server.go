@@ -327,27 +327,32 @@ func parseDTLSClientHelloRandom(b []byte) ([]byte, bool) {
 	// DTLS record header (13 bytes):
 	// b[0] = 22 (handshake)
 	// b[1] = 0xfe (DTLS 1.x / DTLS 1.3)
+	// b[11..12] = record length
 	// Handshake header (12 bytes):
 	// b[13] = 1 (ClientHello)
 	// b[19..21] = fragment_offset (uint24, must be 0 for the initial fragment)
+	// b[22..24] = fragment_length (uint24, must cover version and random)
 	// ClientHello body:
 	// b[25..26] = client_version (2 bytes)
 	// b[27..58] = random (32 bytes)
 	//
-	// Minimum length for a record containing Client Random is 27 + 32 = 59 bytes.
+	// Minimum length for a non-fragmented ClientHello carrying the full
+	// Random is 13 + 12 + 2 + 32 = 59 bytes.
 	if len(b) < 59 || b[0] != 22 || b[1] != 0xfe || b[13] != 1 {
 		return nil, false
 	}
 	if b[19] != 0 || b[20] != 0 || b[21] != 0 {
 		return nil, false
 	}
+	// Reject records that cannot contain the handshake header plus the
+	// version and Random, and first fragments that stop before the Random.
+	// Without this, bytes from a following record could be read as Random.
+	recordLen := int(b[11])<<8 | int(b[12])
+	fragmentLen := int(b[22])<<16 | int(b[23])<<8 | int(b[24])
+	if recordLen < 12+2+32 || recordLen > len(b)-13 || fragmentLen < 2+32 {
+		return nil, false
+	}
 	return b[27:59], true
-}
-
-// isDTLSClientHello checks if a packet looks like a DTLS ClientHello.
-func isDTLSClientHello(b []byte) bool {
-	_, ok := parseDTLSClientHelloRandom(b)
-	return ok
 }
 
 // newPacketConn returns a packetConn serving the flow of sc. Its goroutine
@@ -463,10 +468,7 @@ func (pc *packetConn) SetReadDeadline(t time.Time) error {
 	}
 
 	if !t.IsZero() {
-		d := time.Until(t)
-		if d < 0 {
-			d = 0
-		}
+		d := max(time.Until(t), 0)
 		if pc.deadlineTimer != nil {
 			pc.deadlineTimer.Reset(d)
 		} else {
