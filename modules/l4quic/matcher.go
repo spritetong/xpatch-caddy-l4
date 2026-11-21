@@ -132,6 +132,9 @@ func acceptErrorResult(alpnMismatch, helloMismatch, helloMatched, matchOnFailure
 // matchError applies the configured failure result to a handshake failure
 // that happened before the ClientHello could be decoded.
 func (m *MatchQUIC) matchError(err error) (bool, error) {
+	if errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
+		return false, err
+	}
 	if m.MatchWhenHandshakeFails {
 		return true, nil
 	}

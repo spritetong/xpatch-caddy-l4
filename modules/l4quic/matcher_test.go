@@ -215,6 +215,23 @@ func TestAcceptErrorResult(t *testing.T) {
 	}
 }
 
+func TestMatchErrorKeepsPrefetchSignal(t *testing.T) {
+	m := &MatchQUIC{MatchWhenHandshakeFails: true}
+	matched, err := m.matchError(layer4.ErrConsumedAllPrefetchedBytes)
+	if matched {
+		t.Fatalf("matchError(ErrConsumedAllPrefetchedBytes) returned matched=true, want false")
+	}
+	if !errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
+		t.Fatalf("matchError(ErrConsumedAllPrefetchedBytes) returned err=%v, want ErrConsumedAllPrefetchedBytes", err)
+	}
+
+	// Other errors should return true, nil when MatchWhenHandshakeFails is true
+	matchedOther, errOther := m.matchError(errors.New("handshake failure"))
+	if !matchedOther || errOther != nil {
+		t.Fatalf("matchError(other) returned (%v, %v), want (true, nil)", matchedOther, errOther)
+	}
+}
+
 func TestEvaluateClientHello(t *testing.T) {
 	h2c := map[string]struct{}{"h2c": {}}
 	none := map[string]struct{}{}

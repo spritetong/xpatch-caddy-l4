@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
+	"github.com/mholt/caddy-l4/modules/l4proxyprotocol"
 	"github.com/quic-go/quic-go"
 )
 
@@ -666,5 +668,142 @@ func TestQUICRouteConcurrentLiveClients(t *testing.T) {
 	close(exchangeErr)
 	for err := range exchangeErr {
 		t.Error(err)
+	}
+}
+
+func startH3ProxyProtocolUpstream(t *testing.T, addr string) tls.Certificate {
+	t.Helper()
+	cert := testQUICCert(t)
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		t.Fatalf("upstream listen: %v", err)
+	}
+	wrapper := &l4proxyprotocol.PacketConnWrapper{}
+	if err := wrapper.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("wrapper provision: %v", err)
+	}
+	wrappedPC := wrapper.WrapPacketConn(pc)
+	ln, err := quic.Listen(wrappedPC, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h3"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("upstream quic listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			go func(c *quic.Conn) {
+				stream, err := c.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				buf := make([]byte, 64)
+				if n, err := stream.Read(buf); err == nil && n > 0 {
+					_, _ = stream.Write([]byte("echo:" + string(buf[:n])))
+				}
+			}(conn)
+		}
+	}()
+	return cert
+}
+
+func TestH3RouteWithProxyProtocol(t *testing.T) {
+	freePort := func() string {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := pc.LocalAddr().String()
+		_ = pc.Close()
+		return addr
+	}
+	h3Addr := freePort()
+	cert := startH3ProxyProtocolUpstream(t, h3Addr)
+
+	culvertPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer culvertPC.Close()
+	culvertPkts := make(chan int, 10)
+	go func() {
+		buf := make([]byte, 9000)
+		for {
+			n, _, err := culvertPC.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			culvertPkts <- n
+		}
+	}()
+
+	l4Addr := freePort()
+	cfg := fmt.Sprintf(`{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"quic-dispatch": {
+					"listen": ["udp/%s"],
+					"routes": [
+						{
+							"match": [{"not": [{"quic": {"alpn": ["h2c"], "match_when_handshake_fails": true}}]}],
+							"handle": [{"handler": "proxy", "proxy_protocol": "v2", "upstreams": [{"dial": ["udp/%s"]}]}]
+						},
+						{
+							"handle": [{"handler": "proxy", "upstreams": [{"dial": ["udp/%s"]}]}]
+						}
+					]
+				}
+			}
+		}
+	}
+}`, l4Addr, h3Addr, culvertPC.LocalAddr().String())
+
+	loadCaddyWithJSON(t, []byte(cfg))
+	defer stopCaddy(t)
+
+	pool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.AddCert(parsed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+		RootCAs:    pool,
+		ServerName: "localhost",
+		NextProtos: []string{"h3"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("H3 dial: %v", err)
+	}
+	defer func() { _ = conn.CloseWithError(0, "") }()
+
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	_, _ = stream.Write([]byte("h3-client"))
+	_ = stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 64)
+	n, err := stream.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	if got, want := string(buf[:n]), "echo:h3-client"; got != want {
+		t.Fatalf("response = %q, want %q", got, want)
+	}
+
+	select {
+	case n := <-culvertPkts:
+		t.Fatalf("culvert unexpectedly received %d bytes", n)
+	default:
 	}
 }
