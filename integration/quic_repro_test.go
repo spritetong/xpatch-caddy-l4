@@ -725,22 +725,8 @@ func TestH3RouteWithProxyProtocol(t *testing.T) {
 	h3Addr := freePort()
 	cert := startH3ProxyProtocolUpstream(t, h3Addr)
 
-	culvertPC, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer culvertPC.Close()
-	culvertPkts := make(chan int, 10)
-	go func() {
-		buf := make([]byte, 9000)
-		for {
-			n, _, err := culvertPC.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			culvertPkts <- n
-		}
-	}()
+	culvertAddr := freePort()
+	startQUICUpstream(t, culvertAddr)
 
 	l4Addr := freePort()
 	cfg := fmt.Sprintf(`{
@@ -762,7 +748,7 @@ func TestH3RouteWithProxyProtocol(t *testing.T) {
 			}
 		}
 	}
-}`, l4Addr, h3Addr, culvertPC.LocalAddr().String())
+}`, l4Addr, h3Addr, culvertAddr)
 
 	loadCaddyWithJSON(t, []byte(cfg))
 	defer stopCaddy(t)
@@ -774,6 +760,7 @@ func TestH3RouteWithProxyProtocol(t *testing.T) {
 	}
 	pool.AddCert(parsed)
 
+	// Test 1: H3 client
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
@@ -801,9 +788,155 @@ func TestH3RouteWithProxyProtocol(t *testing.T) {
 		t.Fatalf("response = %q, want %q", got, want)
 	}
 
-	select {
-	case n := <-culvertPkts:
-		t.Fatalf("culvert unexpectedly received %d bytes", n)
-	default:
+	// Test 2: Raw QUIC client 1 with [h3, h2c]
+	rawConn1, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3", "h2c"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("raw quic client 1 dial: %v", err)
+	}
+	defer func() { _ = rawConn1.CloseWithError(0, "") }()
+	rawStream1, err := rawConn1.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("raw quic client 1 open stream: %v", err)
+	}
+	_, _ = rawStream1.Write([]byte("raw-1"))
+	_ = rawStream1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err = rawStream1.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("raw 1 read: %v", err)
+	}
+	if got, want := string(buf[:n]), "echo:raw-1"; got != want {
+		t.Fatalf("raw 1 response = %q, want %q", got, want)
+	}
+
+	// Test 3: Raw QUIC client 2 with h2c while client 1 is still connected!
+	rawConn2, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2c"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("raw quic client 2 dial: %v", err)
+	}
+	defer func() { _ = rawConn2.CloseWithError(0, "") }()
+	rawStream2, err := rawConn2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("raw quic client 2 open stream: %v", err)
+	}
+	_, _ = rawStream2.Write([]byte("raw-2"))
+	_ = rawStream2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err = rawStream2.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("raw 2 read: %v", err)
+	}
+	if got, want := string(buf[:n]), "echo:raw-2"; got != want {
+		t.Fatalf("raw 2 response = %q, want %q", got, want)
+	}
+}
+
+// TestQUICPositiveRouteDispatch verifies the alternative route configuration:
+// Route 0: positive `quic: alpn: ["h2c"]` -> raw QUIC upstream (culvert)
+// Route 1: fallback -> H3 upstream with PROXY protocol v2
+//
+// Clients offering ["h3", "h2c"] must match Route 0 and reach the raw QUIC upstream.
+// Clients offering only ["h3"] must NOT match Route 0 and fall back to the H3 upstream.
+func TestQUICPositiveRouteDispatch(t *testing.T) {
+	freePort := func() string {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := pc.LocalAddr().String()
+		_ = pc.Close()
+		return addr
+	}
+	h3Addr := freePort()
+	cert := startH3ProxyProtocolUpstream(t, h3Addr)
+
+	culvertAddr := freePort()
+	startQUICUpstream(t, culvertAddr)
+
+	l4Addr := freePort()
+	cfg := fmt.Sprintf(`{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"quic-dispatch": {
+					"listen": ["udp/%s"],
+					"routes": [
+						{
+							"match": [{"quic": {"alpn": ["h2c"]}}],
+							"handle": [{"handler": "proxy", "upstreams": [{"dial": ["udp/%s"]}]}]
+						},
+						{
+							"handle": [{"handler": "proxy", "proxy_protocol": "v2", "upstreams": [{"dial": ["udp/%s"]}]}]
+						}
+					]
+				}
+			}
+		}
+	}
+}`, l4Addr, culvertAddr, h3Addr)
+
+	loadCaddyWithJSON(t, []byte(cfg))
+	defer stopCaddy(t)
+
+	pool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.AddCert(parsed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. Raw QUIC client offering ["h3", "h2c"] -> must match Route 0 -> raw upstream
+	rawConn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h3", "h2c"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("raw quic client dial: %v", err)
+	}
+	defer func() { _ = rawConn.CloseWithError(0, "") }()
+	rawStream, err := rawConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open raw stream: %v", err)
+	}
+	_, _ = rawStream.Write([]byte("raw-positive"))
+	_ = rawStream.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 64)
+	n, err := rawStream.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("raw read: %v", err)
+	}
+	if got, want := string(buf[:n]), "echo:raw-positive"; got != want {
+		t.Fatalf("raw response = %q, want %q", got, want)
+	}
+
+	// 2. H3 client offering only ["h3"] -> must fall through to Route 1 -> H3 upstream
+	h3Conn, err := quic.DialAddr(ctx, l4Addr, &tls.Config{
+		RootCAs:    pool,
+		ServerName: "localhost",
+		NextProtos: []string{"h3"},
+	}, &quic.Config{})
+	if err != nil {
+		t.Fatalf("H3 dial: %v", err)
+	}
+	defer func() { _ = h3Conn.CloseWithError(0, "") }()
+	h3Stream, err := h3Conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open H3 stream: %v", err)
+	}
+	_, _ = h3Stream.Write([]byte("h3-positive"))
+	_ = h3Stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+	n, err = h3Stream.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("H3 read: %v", err)
+	}
+	if got, want := string(buf[:n]), "echo:h3-positive"; got != want {
+		t.Fatalf("H3 response = %q, want %q", got, want)
 	}
 }

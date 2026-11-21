@@ -30,6 +30,8 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,23 +78,23 @@ func (m *MatchQUIC) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// quicPipeWriter checks the length of the passed in buffer before writing
+// quicPipeWriter forwards buffered datagrams into the fake packet conn.
 type quicPipeWriter struct {
 	io.Writer
 }
 
 func (q quicPipeWriter) Write(p []byte) (int, error) {
-	if len(p) < QUICPacketBytesMin || len(p) > QUICPacketBytesMax {
-		return 0, errors.New("invalid length for quic packet")
+	if len(p) == 0 {
+		return 0, nil
 	}
 	return q.Writer.Write(p)
 }
 
 // validQUICInitialLength reports whether n can be the length of a QUIC
-// Initial datagram fed to the matcher. The upper bound is inclusive: 1452 is
-// a valid Initial size on a 1500-byte MTU path. Rejecting it would make the
-// matcher report "not QUIC", and `not quic alpn ...` would then send the
-// client to the wrong route.
+// Initial datagram fed to the matcher (excluding the first byte already consumed).
+// RFC 9000 §14.1 requires client Initial packets to be padded to at least 1200 bytes.
+// Valid path MTUs across IPv4 (1472), IPv6 (1452), and Ethernet frames up to 1500
+// bytes are accepted.
 func validQUICInitialLength(n int) bool {
 	return n >= QUICPacketBytesMin-1 && n <= QUICPacketBytesMax
 }
@@ -112,13 +114,21 @@ func hasMatchingALPN(supported []string, expected map[string]struct{}) bool {
 // The configured matchers are evaluated from the ClientHello, so their verdict
 // is authoritative and must not depend on the fake handshake's certificate or
 // deadline. A definitive mismatch stays false; a definitive pass stays true.
-// Only when no ClientHello verdict exists does matchOnFailure apply.
+//
+// When qErr is context.Canceled, the WaitForMore goroutine detected that more
+// wire datagrams arrived from the client. In this case, we MUST return
+// (false, ErrConsumedAllPrefetchedBytes) so that layer4 prefetches the new
+// bytes and re-runs matcher evaluation. Only when the deadline expired with no
+// further bytes does matchOnFailure apply.
 func acceptErrorResult(alpnMismatch, helloMismatch, helloMatched, matchOnFailure bool, qErr error) (bool, error) {
 	if alpnMismatch || helloMismatch {
 		return false, nil
 	}
 	if helloMatched {
 		return true, nil
+	}
+	if errors.Is(qErr, context.Canceled) {
+		return false, layer4.ErrConsumedAllPrefetchedBytes
 	}
 	if matchOnFailure {
 		return true, nil
@@ -183,7 +193,7 @@ func (m *MatchQUIC) evaluateClientHello(cx *layer4.Connection, info *tls.ClientH
 // Match returns true if the connection looks like QUIC.
 func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	// Check if the protocol is UDP
-	if _, isUDP := cx.LocalAddr().(*net.UDPAddr); !isUDP {
+	if _, isUDP := cx.LocalAddr().(*net.UDPAddr); !isUDP && !strings.HasPrefix(cx.LocalAddr().Network(), "udp") {
 		return false, nil
 	}
 
@@ -210,15 +220,27 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		return false, nil
 	}
 
-	// Read the remaining bytes. One byte beyond the maximum is kept so that
-	// a 1452-byte Initial is accepted while a larger one is still rejected.
-	buf = make([]byte, QUICPacketBytesMax+2)
+	// Read the remaining bytes of the initial frame. Sized to MaxBufLen to
+	// accommodate any valid MTU (IPv4 1472, IPv6 1452, jumbo frames, loopback).
+	buf = make([]byte, layer4.MaxBufLen)
 	buf[0] = qFirstByte
 	n, err = io.ReadAtLeast(cx, buf[1:], 1)
 	if err != nil || !validQUICInitialLength(n) {
+		if cx.Logger.Core().Enabled(zap.DebugLevel) {
+			cx.Logger.Debug("quic matcher: initial datagram rejected",
+				zap.Int("bytes", n+1),
+				zap.Error(err),
+			)
+		}
 		return m.matchError(err)
 	}
 	version := quic.Version(binary.BigEndian.Uint32(buf[1:5]))
+	if cx.Logger.Core().Enabled(zap.DebugLevel) {
+		cx.Logger.Debug("quic matcher: read initial datagram",
+			zap.Int("bytes", n+1),
+			zap.String("version", version.String()),
+		)
+	}
 
 	// Use a workaround to match ALPNs. This way quic.EarlyListener.Accept() exits on deadline
 	// if it receives a packet having an ALPN other than those present in tls.Config.NextProtos.
@@ -253,6 +275,14 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		}
 		tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
 			alpnOK, allOK := m.evaluateClientHello(cx, info, expectedALPNs)
+			if cx.Logger.Core().Enabled(zap.DebugLevel) {
+				cx.Logger.Debug("quic matcher: evaluated ClientHello",
+					zap.Strings("supported_alpn", info.SupportedProtos),
+					zap.String("server_name", info.ServerName),
+					zap.Bool("alpn_ok", alpnOK),
+					zap.Bool("all_ok", allOK),
+				)
+			}
 			repl.Set(quicTLSServerNameReplKey, info.ServerName)
 			repl.Set(quicTLSVersionReplKey, caddytls.ProtocolName(tls.VersionTLS13))
 			repl.Set(quicVersionReplKey, version.String())
@@ -538,44 +568,84 @@ func (fpa fakePipeAddr) String() string {
 	return fmt.Sprintf("fake_%v_%v", fpa.ID.String(), fpa.TS.UnixNano())
 }
 
-// fakePacketConn wraps around net.Conn and satisfies net.PacketConn.
+// fakePacketConn implements a true packet-oriented net.PacketConn for
+// feeding synthetic datagrams to quic.Transport without streaming or blocking.
 type fakePacketConn struct {
-	net.Conn
-
-	Local  net.Addr
-	Remote net.Addr
+	local   net.Addr
+	remote  net.Addr
+	inCh    chan []byte
+	outCh   chan []byte
+	lastPkt []byte
+	mu      sync.RWMutex
+	closed  bool
 }
 
 func (fpc *fakePacketConn) LocalAddr() net.Addr {
-	if fpc.Local != nil {
-		return fpc.Local
-	}
-	return fpc.Conn.LocalAddr()
-}
-
-func (fpc *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, err := fpc.Read(p)
-	return n, fpc.RemoteAddr(), err
+	return fpc.local
 }
 
 func (fpc *fakePacketConn) RemoteAddr() net.Addr {
-	if fpc.Remote != nil {
-		return fpc.Remote
+	return fpc.remote
+}
+
+func (fpc *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if len(fpc.lastPkt) > 0 {
+		n := copy(p, fpc.lastPkt)
+		fpc.lastPkt = fpc.lastPkt[n:]
+		return n, fpc.remote, nil
 	}
-	return fpc.Conn.RemoteAddr()
+	pkt, ok := <-fpc.inCh
+	if !ok {
+		return 0, fpc.remote, io.EOF
+	}
+	n := copy(p, pkt)
+	if n < len(pkt) {
+		fpc.lastPkt = pkt[n:]
+	}
+	return n, fpc.remote, nil
 }
 
-func (fpc *fakePacketConn) SetReadBuffer(_ int) error {
-	return nil
-}
-
-func (fpc *fakePacketConn) SetWriteBuffer(_ int) error {
-	return nil
+func (fpc *fakePacketConn) Read(p []byte) (int, error) {
+	n, _, err := fpc.ReadFrom(p)
+	return n, err
 }
 
 func (fpc *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return fpc.Write(p)
+	fpc.mu.RLock()
+	defer fpc.mu.RUnlock()
+	if fpc.closed {
+		return 0, io.ErrClosedPipe
+	}
+	pkt := make([]byte, len(p))
+	copy(pkt, p)
+	select {
+	case fpc.outCh <- pkt:
+		return len(p), nil
+	default:
+		// Drop when buffer is full so the fake sender never blocks or deadlocks
+		return len(p), nil
+	}
 }
+
+func (fpc *fakePacketConn) Write(p []byte) (int, error) {
+	return fpc.WriteTo(p, nil)
+}
+
+func (fpc *fakePacketConn) Close() error {
+	fpc.mu.Lock()
+	if !fpc.closed {
+		fpc.closed = true
+		close(fpc.outCh)
+	}
+	fpc.mu.Unlock()
+	return nil
+}
+
+func (fpc *fakePacketConn) SetDeadline(_ time.Time) error      { return nil }
+func (fpc *fakePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (fpc *fakePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
+func (fpc *fakePacketConn) SetReadBuffer(_ int) error          { return nil }
+func (fpc *fakePacketConn) SetWriteBuffer(_ int) error         { return nil }
 
 // Interface guards
 var (
@@ -612,22 +682,33 @@ const (
 	QUICLongHeaderBitValue uint8 = 0x80 // github.com/quic-go/quic-go/internal/wire.IsLongHeaderPacket()
 	QUICMagicBitValue      uint8 = 0x40 // github.com/quic-go/quic-go/internal/wire.IsPotentialQUICPacket()
 
-	QUICPacketBytesMax = 1452 // github.com/quic-go/quic-go/internal/protocol.MaxPacketBufferSize
+	QUICPacketBytesMax = 1500
 	QUICPacketBytesMin = 1200 // github.com/quic-go/quic-go/internal/protocol.MinInitialPacketSize
 )
 
 func newFakePacketConnPipe(local, remote net.Addr) (*fakePacketConn, *fakePacketConn) {
-	server, client := net.Pipe()
-	serverFPC, clientFPC := &fakePacketConn{Conn: server}, &fakePacketConn{Conn: client}
-	if local != nil || remote != nil {
-		if local == nil {
-			local = remote
-		}
-		if remote == nil {
-			remote = local
-		}
-		serverFPC.Local, clientFPC.Remote = local, local
-		serverFPC.Remote, clientFPC.Local = remote, remote
+	if local == nil && remote == nil {
+		local = &fakePipeAddr{ID: newRand(), TS: time.Now()}
+		remote = local
+	} else if local == nil {
+		local = remote
+	} else if remote == nil {
+		remote = local
+	}
+	ch1 := make(chan []byte, 32)
+	ch2 := make(chan []byte, 32)
+
+	serverFPC := &fakePacketConn{
+		local:  local,
+		remote: remote,
+		inCh:   ch1,
+		outCh:  ch2,
+	}
+	clientFPC := &fakePacketConn{
+		local:  remote,
+		remote: local,
+		inCh:   ch2,
+		outCh:  ch1,
 	}
 	return serverFPC, clientFPC
 }

@@ -194,7 +194,7 @@ func TestAcceptErrorResult(t *testing.T) {
 		{"no ClientHello deadline", false, false, false, false, context.DeadlineExceeded, false, nil},
 		{"no ClientHello cancel", false, false, false, false, context.Canceled, false, layer4.ErrConsumedAllPrefetchedBytes},
 		{"failure result true on deadline", false, false, false, true, context.DeadlineExceeded, true, nil},
-		{"failure result true on cancel", false, false, false, true, context.Canceled, true, nil},
+		{"failure result keeps prefetch on cancel", false, false, false, true, context.Canceled, false, layer4.ErrConsumedAllPrefetchedBytes},
 		{"failure result keeps ALPN mismatch", true, false, false, true, context.DeadlineExceeded, false, nil},
 		{"failure result keeps SNI mismatch", false, true, false, true, context.DeadlineExceeded, false, nil},
 	}
@@ -361,7 +361,9 @@ func TestValidQUICInitialLength(t *testing.T) {
 		{1200, true},
 		{1451, true},
 		{1452, true},
-		{1453, false},
+		{1471, true},
+		{1500, true},
+		{1501, false},
 	} {
 		if got := validQUICInitialLength(tc.n); got != tc.want {
 			t.Errorf("validQUICInitialLength(%d) = %v, want %v", tc.n, got, tc.want)
