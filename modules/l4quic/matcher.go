@@ -225,7 +225,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	buf = make([]byte, layer4.MaxBufLen)
 	buf[0] = qFirstByte
 	n, err = io.ReadAtLeast(cx, buf[1:], 1)
-	if err != nil || !validQUICInitialLength(n) {
+	if err != nil || !validQUICInitialLength(n+1) {
 		if cx.Logger.Core().Enabled(zap.DebugLevel) {
 			cx.Logger.Debug("quic matcher: initial datagram rejected",
 				zap.Int("bytes", n+1),
@@ -263,6 +263,10 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	// handshake with a self-signed certificate happens to complete. Match
 	// reads the flags after Accept returns, so the handoff from the handshake
 	// goroutine is done atomically.
+	// Prepare a context with a deadline
+	qContext, qCancel := context.WithDeadline(context.Background(), time.Now().Add(QUICAcceptTimeout))
+	defer qCancel()
+
 	var (
 		alpnMismatch  atomic.Bool
 		helloMismatch atomic.Bool
@@ -295,6 +299,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 				return nil, errors.New("quic matcher: handshake matcher mismatch")
 			}
 			helloMatched.Store(true)
+			qCancel()
 			return nil, nil
 		}
 	}
@@ -342,9 +347,6 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	if cx.HasMore() {
 		return false, layer4.ErrConsumedAllPrefetchedBytes
 	}
-
-	// Prepare a context with a deadline
-	qContext, qCancel := context.WithDeadline(context.Background(), time.Now().Add(QUICAcceptTimeout))
 
 	// spawn a new go routine to monitor new data. It's possible the available data is enough to determine the quic connection and the context is wrongly canceled.
 	done := make(chan struct{})
