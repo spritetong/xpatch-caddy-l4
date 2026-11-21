@@ -97,6 +97,14 @@ func initialSalt(version uint32) []byte {
 	}
 }
 
+// isGreaseVersion reports whether v is a reserved GREASE version. RFC 9000
+// §6.3 reserves versions of the form 0x?a?a?a?a for version negotiation.
+// Such a packet uses the framing and Initial keys of a supported version,
+// so the sniffer derives keys from that version instead of rejecting it.
+func isGreaseVersion(v uint32) bool {
+	return v&0x0f0f0f0f == 0x0a0a0a0a
+}
+
 // initialKeyAndIV derives the client Initial key and IV from the DCID.
 // QUIC Initial keys are public: RFC 9001 §5.2 states this encryption level
 // provides no confidentiality, only integrity. That is what makes passive
@@ -148,8 +156,9 @@ func decryptInitialPayload(key, iv []byte, pn uint64, ciphertext, aad []byte) ([
 }
 
 // decryptInitial decrypts one client Initial datagram and returns its CRYPTO
-// frames. It is a pure function with no mutable state, so it is safe to call
-// from concurrently handled connections.
+// frames. Reserved GREASE versions are keyed using the v1 or v2 format their
+// packet type impersonates. It is a pure function with no mutable state, so
+// it is safe to call from concurrently handled connections.
 func decryptInitial(pkt []byte) (*decryptedInitial, error) {
 	if len(pkt) < 1+4+2 {
 		return nil, errInitialTooShort
@@ -170,19 +179,35 @@ func decryptInitial(pkt []byte) (*decryptedInitial, error) {
 		return nil, errInitialTooShort
 	}
 	// Long packet type occupies bits 4-5 and is not covered by header
-	// protection. v1/draft-29 encode Initial as 0, v2 as 2.
+	// protection. v1/draft-29 encode Initial as 0, v2 as 2. A GREASE version
+	// impersonates one of those formats; its packet type tells us which key
+	// schedule to use. Report the impersonated version so callers get a
+	// meaningful protocol name.
 	packetType := (first & 0x30) >> 4
+	var keyVersion uint32
 	switch version {
 	case quicVersion1, quicVersionDraft29:
 		if packetType != 0 {
 			return nil, errNotQUICInitial
 		}
+		keyVersion = version
 	case quicVersion2:
 		if packetType != 2 {
 			return nil, errNotQUICInitial
 		}
+		keyVersion = version
 	default:
-		return nil, errUnsupportedQUICVer
+		if !isGreaseVersion(version) {
+			return nil, errUnsupportedQUICVer
+		}
+		switch packetType {
+		case 0:
+			keyVersion = quicVersion1
+		case 2:
+			keyVersion = quicVersion2
+		default:
+			return nil, errNotQUICInitial
+		}
 	}
 
 	dcidLen, err := r.ReadByte()
@@ -226,7 +251,7 @@ func decryptInitial(pkt []byte) (*decryptedInitial, error) {
 		return nil, errInitialTooShort
 	}
 
-	block, err := aes.NewCipher(headerProtectionKey(dcid, version))
+	block, err := aes.NewCipher(headerProtectionKey(dcid, keyVersion))
 	if err != nil {
 		return nil, errBadHeaderProtection
 	}
@@ -252,7 +277,7 @@ func decryptInitial(pkt []byte) (*decryptedInitial, error) {
 		pn = pn<<8 | uint64(plain[hdrLen+i])
 	}
 
-	key, iv := initialKeyAndIV(dcid, version)
+	key, iv := initialKeyAndIV(dcid, keyVersion)
 	payloadLen := int(packetLen) //nolint:gosec // bounded by packetLen <= len(pkt)-hdrLen
 	payload, err := decryptInitialPayload(key, iv, pn,
 		plain[extHdrLen:hdrLen+payloadLen], plain[:extHdrLen])
@@ -264,7 +289,7 @@ func decryptInitial(pkt []byte) (*decryptedInitial, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &decryptedInitial{version: version, fragments: fragments}, nil
+	return &decryptedInitial{version: keyVersion, fragments: fragments}, nil
 }
 
 // parseCryptoFrames extracts CRYPTO frames from a decrypted Initial payload.

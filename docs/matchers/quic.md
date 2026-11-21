@@ -12,7 +12,10 @@ handshake matchers against the recovered ClientHello. Because the Initial keys
 are derived from the destination connection ID (which is public by design,
 see RFC 9001 §5.2), no TLS handshake, certificate, or timing is involved in the
 decision. QUIC v1, v2 and draft-29 are supported; ClientHello CRYPTO fragments
-spanning multiple datagrams are reassembled across matching rounds.
+spanning multiple datagrams are reassembled across matching rounds. Reserved
+GREASE versions (`0x?a?a?a?a`, used by quiche by default) are also handled: the
+sniffer derives their Initial keys from the v1 or v2 format they impersonate,
+so matching happens before version negotiation completes.
 
 ## Syntax
 
