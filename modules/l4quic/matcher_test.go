@@ -15,7 +15,9 @@
 package l4quic
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -24,9 +26,11 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 
 	"github.com/mholt/caddy-l4/layer4"
+	"github.com/mholt/caddy-l4/modules/l4tls"
 )
 
 func assertNoError(t *testing.T, err error) {
@@ -168,6 +172,183 @@ func Test_MatchQUIC_DeadlineReturnsNotMatched(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("Match returned err=%v for deadline-exceeded path; want nil so layer4 marks NotMatched and falls through (returning ErrConsumedAllPrefetchedBytes here would block the route loop until matchingTimeout)", err)
+	}
+}
+
+// TestAcceptErrorResult verifies that the ClientHello verdict is authoritative
+// even when the fake handshake fails: a definitive ALPN/SNI match stays true,
+// a definitive mismatch stays false. match_when_handshake_fails is only used
+// when no ClientHello verdict exists.
+func TestAcceptErrorResult(t *testing.T) {
+	tests := []struct {
+		name                                                      string
+		alpnMismatch, helloMismatch, helloMatched, matchOnFailure bool
+		qErr                                                      error
+		wantMatched                                               bool
+		wantErrIs                                                 error
+	}{
+		{"matching ClientHello then deadline", false, false, true, false, context.DeadlineExceeded, true, nil},
+		{"matching ClientHello then cancel", false, false, true, false, context.Canceled, true, nil},
+		{"ALPN mismatch", true, false, false, false, context.DeadlineExceeded, false, nil},
+		{"SNI mismatch", false, true, false, false, context.DeadlineExceeded, false, nil},
+		{"no ClientHello deadline", false, false, false, false, context.DeadlineExceeded, false, nil},
+		{"no ClientHello cancel", false, false, false, false, context.Canceled, false, layer4.ErrConsumedAllPrefetchedBytes},
+		{"failure result true on deadline", false, false, false, true, context.DeadlineExceeded, true, nil},
+		{"failure result true on cancel", false, false, false, true, context.Canceled, true, nil},
+		{"failure result keeps ALPN mismatch", true, false, false, true, context.DeadlineExceeded, false, nil},
+		{"failure result keeps SNI mismatch", false, true, false, true, context.DeadlineExceeded, false, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			matched, err := acceptErrorResult(tc.alpnMismatch, tc.helloMismatch, tc.helloMatched, tc.matchOnFailure, tc.qErr)
+			if matched != tc.wantMatched {
+				t.Fatalf("matched = %v, want %v", matched, tc.wantMatched)
+			}
+			if tc.wantErrIs == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			} else if !errors.Is(err, tc.wantErrIs) {
+				t.Fatalf("err = %v, want %v", err, tc.wantErrIs)
+			}
+		})
+	}
+}
+
+func TestEvaluateClientHello(t *testing.T) {
+	h2c := map[string]struct{}{"h2c": {}}
+	none := map[string]struct{}{}
+	tests := []struct {
+		name         string
+		matchers     []caddytls.ConnectionMatcher
+		expectedALPN map[string]struct{}
+		supported    []string
+		serverName   string
+		wantALPN     bool
+		wantAll      bool
+	}{
+		{
+			name:         "raw client with h3 and h2c",
+			matchers:     []caddytls.ConnectionMatcher{&l4tls.MatchALPN{"h2c"}},
+			expectedALPN: h2c,
+			supported:    []string{"h3", "h2c"},
+			wantALPN:     true,
+			wantAll:      true,
+		},
+		{
+			name:         "h3-only client",
+			matchers:     []caddytls.ConnectionMatcher{&l4tls.MatchALPN{"h2c"}},
+			expectedALPN: h2c,
+			supported:    []string{"h3"},
+			wantALPN:     false,
+			wantAll:      false,
+		},
+		{
+			name:         "ALPN matches but SNI does not",
+			matchers:     []caddytls.ConnectionMatcher{&l4tls.MatchALPN{"h2c"}, caddytls.MatchServerName{"example.com"}},
+			expectedALPN: h2c,
+			supported:    []string{"h3", "h2c"},
+			serverName:   "other.example.net",
+			wantALPN:     true,
+			wantAll:      false,
+		},
+		{
+			name:         "ALPN and SNI both match",
+			matchers:     []caddytls.ConnectionMatcher{&l4tls.MatchALPN{"h2c"}, caddytls.MatchServerName{"example.com"}},
+			expectedALPN: h2c,
+			supported:    []string{"h3", "h2c"},
+			serverName:   "example.com",
+			wantALPN:     true,
+			wantAll:      true,
+		},
+		{
+			name:         "SNI only, no ALPN constraint",
+			matchers:     []caddytls.ConnectionMatcher{caddytls.MatchServerName{"example.com"}},
+			expectedALPN: none,
+			supported:    []string{"h3"},
+			serverName:   "example.com",
+			wantALPN:     true,
+			wantAll:      true,
+		},
+		{
+			name:         "no matchers",
+			expectedALPN: none,
+			supported:    []string{"h3", "h2c"},
+			wantALPN:     true,
+			wantAll:      true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &MatchQUIC{matchers: tc.matchers}
+			info := &tls.ClientHelloInfo{SupportedProtos: tc.supported, ServerName: tc.serverName}
+			alpnOK, allOK := m.evaluateClientHello(nil, info, tc.expectedALPN)
+			if alpnOK != tc.wantALPN || allOK != tc.wantAll {
+				t.Fatalf("evaluateClientHello() = (%v, %v), want (%v, %v)", alpnOK, allOK, tc.wantALPN, tc.wantAll)
+			}
+		})
+	}
+}
+
+func TestMatchQUICMatchWhenHandshakeFailsJSON(t *testing.T) {
+	m := &MatchQUIC{}
+	raw := []byte(`{"alpn":["h2c"],"match_when_handshake_fails":true}`)
+	if err := json.Unmarshal(raw, m); err != nil {
+		t.Fatal(err)
+	}
+	if !m.MatchWhenHandshakeFails {
+		t.Fatal("match_when_handshake_fails was not decoded")
+	}
+	if _, ok := m.MatchersRaw["alpn"]; !ok {
+		t.Fatalf("alpn matcher was lost: %#v", m.MatchersRaw)
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var round map[string]json.RawMessage
+	if err := json.Unmarshal(out, &round); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := round["alpn"]; !ok {
+		t.Fatalf("alpn matcher missing from JSON: %s", out)
+	}
+	if _, ok := round["match_when_handshake_fails"]; !ok {
+		t.Fatalf("option missing from JSON: %s", out)
+	}
+
+	plain := &MatchQUIC{}
+	if err := json.Unmarshal([]byte(`{"alpn":["h2c"]}`), plain); err != nil {
+		t.Fatal(err)
+	}
+	if plain.MatchWhenHandshakeFails {
+		t.Fatal("option should default to false")
+	}
+	plainOut, err := json.Marshal(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(plainOut, []byte("match_when_handshake_fails")) {
+		t.Fatalf("false option should be omitted: %s", plainOut)
+	}
+}
+
+func TestValidQUICInitialLength(t *testing.T) {
+	for _, tc := range []struct {
+		n    int
+		want bool
+	}{
+		{1198, false},
+		{1199, true},
+		{1200, true},
+		{1451, true},
+		{1452, true},
+		{1453, false},
+	} {
+		if got := validQUICInitialLength(tc.n); got != tc.want {
+			t.Errorf("validQUICInitialLength(%d) = %v, want %v", tc.n, got, tc.want)
+		}
 	}
 }
 

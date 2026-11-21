@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,6 +55,14 @@ var isTesting bool
 type MatchQUIC struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=tls.handshake_match"`
 
+	// MatchWhenHandshakeFails is the match result returned when the fake
+	// handshake fails or the ClientHello cannot be decoded. With true, a
+	// negated matcher such as `not quic { ... }` becomes false and the flow
+	// falls through to a following route. With false, a positive `quic`
+	// matcher does not claim such flows. Definitive results, e.g. an ALPN
+	// or SNI mismatch, are unaffected. Default: false.
+	MatchWhenHandshakeFails bool `json:"match_when_handshake_fails,omitempty"`
+
 	matchers []caddytls.ConnectionMatcher
 	quicConf *quic.Config
 	tlsConf  *tls.Config
@@ -79,6 +88,15 @@ func (q quicPipeWriter) Write(p []byte) (int, error) {
 	return q.Writer.Write(p)
 }
 
+// validQUICInitialLength reports whether n can be the length of a QUIC
+// Initial datagram fed to the matcher. The upper bound is inclusive: 1452 is
+// a valid Initial size on a 1500-byte MTU path. Rejecting it would make the
+// matcher report "not QUIC", and `not quic alpn ...` would then send the
+// client to the wrong route.
+func validQUICInitialLength(n int) bool {
+	return n >= QUICPacketBytesMin-1 && n <= QUICPacketBytesMax
+}
+
 // hasMatchingALPN reports whether the client offered at least one of the
 // configured ALPNs. It is only called when at least one ALPN is configured.
 func hasMatchingALPN(supported []string, expected map[string]struct{}) bool {
@@ -88,6 +106,75 @@ func hasMatchingALPN(supported []string, expected map[string]struct{}) bool {
 		}
 	}
 	return false
+}
+
+// acceptErrorResult decides a match when the fake handshake did not complete.
+// The configured matchers are evaluated from the ClientHello, so their verdict
+// is authoritative and must not depend on the fake handshake's certificate or
+// deadline. A definitive mismatch stays false; a definitive pass stays true.
+// Only when no ClientHello verdict exists does matchOnFailure apply.
+func acceptErrorResult(alpnMismatch, helloMismatch, helloMatched, matchOnFailure bool, qErr error) (bool, error) {
+	if alpnMismatch || helloMismatch {
+		return false, nil
+	}
+	if helloMatched {
+		return true, nil
+	}
+	if matchOnFailure {
+		return true, nil
+	}
+	if errors.Is(qErr, context.DeadlineExceeded) {
+		return false, nil
+	}
+	return false, layer4.ErrConsumedAllPrefetchedBytes
+}
+
+// matchError applies the configured failure result to a handshake failure
+// that happened before the ClientHello could be decoded.
+func (m *MatchQUIC) matchError(err error) (bool, error) {
+	if m.MatchWhenHandshakeFails {
+		return true, nil
+	}
+	return false, err
+}
+
+// evaluateClientHello runs every configured handshake matcher against the
+// ClientHello, before the fake QUIC handshake finishes. It returns whether
+// the ALPN constraint is satisfied and whether all matchers passed. Both
+// results are needed: a route must not be selected on ALPN alone when SNI or
+// another matcher is also configured.
+//
+// The ClientHelloInfo mirrors the one built from ConnectionState after a
+// successful handshake: ALPN matchers are handled separately, and the
+// negotiated protocol is represented by the offered ALPNs that we accepted.
+func (m *MatchQUIC) evaluateClientHello(cx *layer4.Connection, info *tls.ClientHelloInfo, expectedALPNs map[string]struct{}) (bool, bool) {
+	alpnMatched := len(expectedALPNs) == 0 || hasMatchingALPN(info.SupportedProtos, expectedALPNs)
+	if !alpnMatched {
+		return false, false
+	}
+
+	var offered []string
+	for _, p := range info.SupportedProtos {
+		if _, ok := expectedALPNs[p]; ok {
+			offered = append(offered, p)
+		}
+	}
+	chi := &tls.ClientHelloInfo{
+		CipherSuites:      info.CipherSuites,
+		ServerName:        info.ServerName,
+		SupportedProtos:   offered,
+		SupportedVersions: []uint16{tls.VersionTLS13},
+		Conn:              cx,
+	}
+	for _, matcher := range m.matchers {
+		if _, isALPN := matcher.(*l4tls.MatchALPN); isALPN {
+			continue
+		}
+		if !matcher.Match(chi) {
+			return true, false
+		}
+	}
+	return true, true
 }
 
 // Match returns true if the connection looks like QUIC.
@@ -102,7 +189,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	buf := make([]byte, n)
 	_, err := io.ReadAtLeast(cx, buf, n)
 	if err != nil {
-		return false, err
+		return m.matchError(err)
 	}
 
 	// Ensure the second bit of the first byte is set, i.e. continue if
@@ -120,13 +207,15 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		return false, nil
 	}
 
-	// Read the remaining bytes
-	buf = make([]byte, QUICPacketBytesMax+1)
+	// Read the remaining bytes. One byte beyond the maximum is kept so that
+	// a 1452-byte Initial is accepted while a larger one is still rejected.
+	buf = make([]byte, QUICPacketBytesMax+2)
 	buf[0] = qFirstByte
 	n, err = io.ReadAtLeast(cx, buf[1:], 1)
-	if err != nil || n < QUICPacketBytesMin-1 || n == QUICPacketBytesMax {
-		return false, err
+	if err != nil || !validQUICInitialLength(n) {
+		return m.matchError(err)
 	}
+	version := quic.Version(binary.BigEndian.Uint32(buf[1:5]))
 
 	// Use a workaround to match ALPNs. This way quic.EarlyListener.Accept() exits on deadline
 	// if it receives a packet having an ALPN other than those present in tls.Config.NextProtos.
@@ -143,19 +232,36 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 		}
 	}
 
-	// GetConfigForClient runs on the handshake goroutine, while Match reads
-	// the flag after Accept returns. Keep the handoff race-free.
-	var alpnMismatch atomic.Bool
-	if len(tlsConf.NextProtos) > 0 {
+	// All handshake matchers are evaluated as soon as the ClientHello is
+	// available. This is the authoritative match verdict: it depends only on
+	// the ClientHello (ALPN, SNI, ...), not on whether the matcher's own fake
+	// handshake with a self-signed certificate happens to complete. Match
+	// reads the flags after Accept returns, so the handoff from the handshake
+	// goroutine is done atomically.
+	var (
+		alpnMismatch  atomic.Bool
+		helloMismatch atomic.Bool
+		helloMatched  atomic.Bool
+	)
+	if len(tlsConf.NextProtos) > 0 || len(m.matchers) > 0 {
 		expectedALPNs := make(map[string]struct{}, len(tlsConf.NextProtos))
 		for _, p := range tlsConf.NextProtos {
 			expectedALPNs[p] = struct{}{}
 		}
 		tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
-			if !hasMatchingALPN(info.SupportedProtos, expectedALPNs) {
+			alpnOK, allOK := m.evaluateClientHello(cx, info, expectedALPNs)
+			repl.Set(quicTLSServerNameReplKey, info.ServerName)
+			repl.Set(quicTLSVersionReplKey, caddytls.ProtocolName(tls.VersionTLS13))
+			repl.Set(quicVersionReplKey, version.String())
+			if !alpnOK {
 				alpnMismatch.Store(true)
 				return nil, errors.New("quic matcher: ALPN mismatch")
 			}
+			if !allOK {
+				helloMismatch.Store(true)
+				return nil, errors.New("quic matcher: handshake matcher mismatch")
+			}
+			helloMatched.Store(true)
 			return nil, nil
 		}
 	}
@@ -174,7 +280,7 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	if err != nil {
 		_ = serverFPC.Close()
 		_ = clientFPC.Close()
-		return false, err
+		return m.matchError(err)
 	}
 	// Single combined cleanup so qListener.Close() always runs (closes the
 	// upstream-leaked listener on Accept-error paths) and the fakePacketConn
@@ -190,13 +296,13 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 	// Write the buffered bytes into the pipe
 	_, err = clientFPC.WriteTo(buf[:n+1], nil)
 	if err != nil {
-		return false, nil
+		return m.matchError(nil)
 	}
 
 	// Write more buffered bytes into the pipe, the writer here ensures all frames are likely quic frames based on their lengths
 	_, err = io.CopyBuffer(quicPipeWriter{clientFPC}, cx, buf)
 	if err != nil && !errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
-		return false, err
+		return m.matchError(err)
 	}
 
 	// return if there are more data to be read, usually there will be frames buffered at the start of a connection.
@@ -256,14 +362,11 @@ func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
 				zap.String("remote", cx.RemoteAddr().String()),
 				zap.Error(err))
 		}
-		// Discriminate qContext exit (from #413 / merged): DeadlineExceeded
-		// returns (false, nil) so layer4 marks NotMatched and falls through;
-		// Canceled (WaitForMore fired) returns ErrConsumedAllPrefetchedBytes
-		// so the next prefetch round can complete the handshake.
-		if alpnMismatch.Load() || errors.Is(qContext.Err(), context.DeadlineExceeded) {
-			return false, nil
-		}
-		return false, layer4.ErrConsumedAllPrefetchedBytes
+		// The ClientHello verdict outranks the fake handshake's fate: a
+		// configured ALPN/SNI match is a match even if the self-signed cert
+		// or the 1s deadline stops the fake handshake. Only flows with no
+		// ClientHello verdict fall back to match_when_handshake_fails.
+		return acceptErrorResult(alpnMismatch.Load(), helloMismatch.Load(), helloMatched.Load(), m.MatchWhenHandshakeFails, qContext.Err())
 	}
 
 	// Obtain a quic.ConnectionState
@@ -381,14 +484,40 @@ func (m *MatchQUIC) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// UnmarshalJSON satisfies the json.Unmarshaler interface.
+// UnmarshalJSON satisfies the json.Unmarshaler interface. The option is
+// pulled out before the remaining keys are loaded as handshake matchers.
 func (m *MatchQUIC) UnmarshalJSON(b []byte) error {
-	return json.Unmarshal(b, &m.MatchersRaw)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return err
+	}
+	if raw, ok := fields["match_when_handshake_fails"]; ok {
+		if err := json.Unmarshal(raw, &m.MatchWhenHandshakeFails); err != nil {
+			return fmt.Errorf("unmarshaling match_when_handshake_fails: %w", err)
+		}
+		delete(fields, "match_when_handshake_fails")
+	}
+	rest, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(rest, &m.MatchersRaw)
 }
 
 // MarshalJSON satisfies the json.Marshaler interface.
 func (m *MatchQUIC) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.MatchersRaw)
+	out := make(caddy.ModuleMap, len(m.MatchersRaw)+1)
+	for name, raw := range m.MatchersRaw {
+		out[name] = raw
+	}
+	if m.MatchWhenHandshakeFails {
+		raw, err := json.Marshal(true)
+		if err != nil {
+			return nil, err
+		}
+		out["match_when_handshake_fails"] = raw
+	}
+	return json.Marshal(out)
 }
 
 // fakePipeAddr satisfies net.Addr and uses a random number and a timestamp

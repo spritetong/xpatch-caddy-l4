@@ -26,6 +26,19 @@ When QUIC traffic is detected, the matcher registers the following placeholders:
 - `l4.quic.tls.version` with the relevant TLS version, e.g. `tls1.3` for TLS 1.3;
 - `l4.quic.version` with the relevant QUIC version, e.g. `draft-29`, `v1`, `v2`.
 
+The inner matchers (ALPN, SNI, ...) are evaluated as soon as the ClientHello is
+available. Their verdict is authoritative and does not depend on whether the
+matcher's own fake QUIC handshake completes; in particular, a client that rejects
+the matcher's self-signed certificate is still matched by its ALPN/SNI.
+
+The JSON form accepts an additional `match_when_handshake_fails` option (default
+`false`). It is the result returned only when no ClientHello verdict could be
+obtained, e.g. the handshake failed before the ClientHello was decoded. With
+`true`, `not quic { ... }` becomes `false` on such failures, so the negated route
+is skipped and a following fallback route receives the flow; with `false`, a
+positive `quic` matcher does not claim those flows. A definitive ClientHello
+match or mismatch is unaffected by this option.
+
 ### Caddyfile
 
 The matcher supports the following syntax:
