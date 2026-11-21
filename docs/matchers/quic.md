@@ -6,8 +6,13 @@ title: QUIC Matcher
 
 ## Summary
 
-The QUIC matcher allows to match connections that look like [QUIC](https://quic.xargs.org/).
-The matcher uses [quic-go](https://github.com/quic-go/quic-go) package to parse QUIC traffic under the hood.
+The QUIC matcher matches connections that look like [QUIC](https://quic.xargs.org/).
+It passively decrypts the client's QUIC Initial packets and evaluates TLS
+handshake matchers against the recovered ClientHello. Because the Initial keys
+are derived from the destination connection ID (which is public by design,
+see RFC 9001 §5.2), no TLS handshake, certificate, or timing is involved in the
+decision. QUIC v1, v2 and draft-29 are supported; ClientHello CRYPTO fragments
+spanning multiple datagrams are reassembled across matching rounds.
 
 ## Syntax
 
@@ -26,18 +31,18 @@ When QUIC traffic is detected, the matcher registers the following placeholders:
 - `l4.quic.tls.version` with the relevant TLS version, e.g. `tls1.3` for TLS 1.3;
 - `l4.quic.version` with the relevant QUIC version, e.g. `draft-29`, `v1`, `v2`.
 
-The inner matchers (ALPN, SNI, ...) are evaluated as soon as the ClientHello is
-available. Their verdict is authoritative and does not depend on whether the
-matcher's own fake QUIC handshake completes; in particular, a client that rejects
-the matcher's self-signed certificate is still matched by its ALPN/SNI.
+The inner matchers (ALPN, SNI, ...) are evaluated against the sniffed
+ClientHello. This verdict depends only on the client's ClientHello bytes, never
+on a handshake: a client that would reject any server certificate is still
+classified by the ALPN/SNI it actually offered.
 
 The JSON form accepts an additional `match_when_handshake_fails` option (default
-`false`). It is the result returned only when no ClientHello verdict could be
-obtained, e.g. the handshake failed before the ClientHello was decoded. With
-`true`, `not quic { ... }` becomes `false` on such failures, so the negated route
-is skipped and a following fallback route receives the flow; with `false`, a
-positive `quic` matcher does not claim those flows. A definitive ClientHello
-match or mismatch is unaffected by this option.
+`false`). It is the result returned only when no ClientHello can be recovered,
+e.g. the datagram is not a decryptable QUIC Initial. With `true`,
+`not quic { ... }` becomes `false` on such flows, so the negated route is skipped
+and a following fallback route receives the flow; with `false`, a positive
+`quic` matcher does not claim them. A definitive ClientHello match or mismatch
+is unaffected by this option.
 
 ### Caddyfile
 

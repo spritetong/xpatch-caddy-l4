@@ -15,7 +15,7 @@ all inherit the same matchers, or for multiple routes that should be treated as 
 
 The handler has the following fields:
 - `matching_timeout` is the maximum time connections have to complete the matching phase
-  (the first terminal handler is matched). By default, it equals 3s.
+  (the first terminal handler is matched). By default, it equals 10s.
 - `routes` contains [routes](/docs/routes.md) the same way they are defined in [servers](/docs/servers.md).
 
 No [placeholders](https://caddyserver.com/docs/conventions#placeholders) are supported.

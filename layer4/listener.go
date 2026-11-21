@@ -24,7 +24,7 @@ type ListenerWrapper struct {
 	// Routes express composable logic for handling byte streams.
 	Routes RouteList `json:"routes,omitempty"`
 
-	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 3s.
+	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 10s.
 	MatchingTimeout caddy.Duration `json:"matching_timeout,omitempty"`
 
 	compiledRoute Handler

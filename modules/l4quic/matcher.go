@@ -15,30 +15,18 @@
 package l4quic
 
 import (
-	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math"
-	"math/big"
+	"maps"
 	"net"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
 
 	"github.com/mholt/caddy-l4/layer4"
@@ -49,25 +37,22 @@ func init() {
 	caddy.RegisterModule(&MatchQUIC{})
 }
 
-var isTesting bool
-
-// MatchQUIC is able to match QUIC connections. Its structure
-// is different from the auto-generated documentation. This
-// value should be a map of matcher names to their values.
+// MatchQUIC matches QUIC connections by passively decrypting the client's
+// Initial packets and evaluating TLS handshake matchers against the recovered
+// ClientHello. Its structure is different from the auto-generated docs: the
+// fields are a map of tls.handshake_match modules.
 type MatchQUIC struct {
 	MatchersRaw caddy.ModuleMap `json:"-" caddy:"namespace=tls.handshake_match"`
 
-	// MatchWhenHandshakeFails is the match result returned when the fake
-	// handshake fails or the ClientHello cannot be decoded. With true, a
-	// negated matcher such as `not quic { ... }` becomes false and the flow
-	// falls through to a following route. With false, a positive `quic`
-	// matcher does not claim such flows. Definitive results, e.g. an ALPN
-	// or SNI mismatch, are unaffected. Default: false.
+	// MatchWhenHandshakeFails is the match result returned when the QUIC
+	// Initial cannot be sniffed (no ClientHello can be recovered). With true,
+	// a negated matcher such as `not quic { ... }` becomes false and the flow
+	// falls through to a following fallback route. With false, a positive
+	// `quic` matcher does not claim such flows. Definitive ClientHello results
+	// (ALPN, SNI, ...) are unaffected. Default: false.
 	MatchWhenHandshakeFails bool `json:"match_when_handshake_fails,omitempty"`
 
 	matchers []caddytls.ConnectionMatcher
-	quicConf *quic.Config
-	tlsConf  *tls.Config
 }
 
 // CaddyModule returns the Caddy module information.
@@ -78,378 +63,124 @@ func (m *MatchQUIC) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// quicPipeWriter forwards buffered datagrams into the fake packet conn.
-type quicPipeWriter struct {
-	io.Writer
-}
-
-func (q quicPipeWriter) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	return q.Writer.Write(p)
-}
-
-// validQUICInitialLength reports whether n can be the length of a QUIC
-// Initial datagram fed to the matcher (excluding the first byte already consumed).
-// RFC 9000 §14.1 requires client Initial packets to be padded to at least 1200 bytes.
-// Valid path MTUs across IPv4 (1472), IPv6 (1452), and Ethernet frames up to 1500
-// bytes are accepted.
-func validQUICInitialLength(n int) bool {
-	return n >= QUICPacketBytesMin-1 && n <= QUICPacketBytesMax
-}
-
-// hasMatchingALPN reports whether the client offered at least one of the
-// configured ALPNs. It is only called when at least one ALPN is configured.
-func hasMatchingALPN(supported []string, expected map[string]struct{}) bool {
-	for _, p := range supported {
-		if _, ok := expected[p]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// acceptErrorResult decides a match when the fake handshake did not complete.
-// The configured matchers are evaluated from the ClientHello, so their verdict
-// is authoritative and must not depend on the fake handshake's certificate or
-// deadline. A definitive mismatch stays false; a definitive pass stays true.
+// sniffClientHello reads every prefetched datagram, decrypts those that are
+// QUIC Initials, and reassembles the ClientHello from CRYPTO fragments.
 //
-// When qErr is context.Canceled, the WaitForMore goroutine detected that more
-// wire datagrams arrived from the client. In this case, we MUST return
-// (false, ErrConsumedAllPrefetchedBytes) so that layer4 prefetches the new
-// bytes and re-runs matcher evaluation. Only when the deadline expired with no
-// further bytes does matchOnFailure apply.
-func acceptErrorResult(alpnMismatch, helloMismatch, helloMatched, matchOnFailure bool, qErr error) (bool, error) {
-	if alpnMismatch || helloMismatch {
-		return false, nil
-	}
-	if helloMatched {
-		return true, nil
-	}
-	if errors.Is(qErr, context.Canceled) {
-		return false, layer4.ErrConsumedAllPrefetchedBytes
-	}
-	if matchOnFailure {
-		return true, nil
-	}
-	if errors.Is(qErr, context.DeadlineExceeded) {
-		return false, nil
-	}
-	return false, layer4.ErrConsumedAllPrefetchedBytes
-}
-
-// matchError applies the configured failure result to a handshake failure
-// that happened before the ClientHello could be decoded.
-func (m *MatchQUIC) matchError(err error) (bool, error) {
-	if errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
-		return false, err
-	}
-	if m.MatchWhenHandshakeFails {
-		return true, nil
-	}
-	return false, err
-}
-
-// evaluateClientHello runs every configured handshake matcher against the
-// ClientHello, before the fake QUIC handshake finishes. It returns whether
-// the ALPN constraint is satisfied and whether all matchers passed. Both
-// results are needed: a route must not be selected on ALPN alone when SNI or
-// another matcher is also configured.
+// Returns:
+//   - hello, nil: a complete ClientHello was recovered.
+//   - nil, ErrConsumedAllPrefetchedBytes: datagrams were valid Initials but the
+//     CRYPTO stream is incomplete; layer4 should prefetch more and retry.
+//   - nil, err: sniffing is not possible (no Initial / bad packet / no data).
 //
-// The ClientHelloInfo mirrors the one built from ConnectionState after a
-// successful handshake: ALPN matchers are handled separately, and the
-// negotiated protocol is represented by the offered ALPNs that we accepted.
-func (m *MatchQUIC) evaluateClientHello(cx *layer4.Connection, info *tls.ClientHelloInfo, expectedALPNs map[string]struct{}) (bool, bool) {
-	alpnMatched := len(expectedALPNs) == 0 || hasMatchingALPN(info.SupportedProtos, expectedALPNs)
-	if !alpnMatched {
-		return false, false
-	}
+// It keeps no state on the matcher, which is shared across connections; each
+// call re-reads the accumulated buffer from the start.
+func (m *MatchQUIC) sniffClientHello(cx *layer4.Connection, logger *zap.Logger) (*sniffedHello, uint32, error) {
+	var fragments []cryptoFragment
+	var sawInitial, sawData bool
+	var quicVer uint32
+	buf := make([]byte, layer4.MaxBufLen)
 
-	var offered []string
-	for _, p := range info.SupportedProtos {
-		if _, ok := expectedALPNs[p]; ok {
-			offered = append(offered, p)
+	for {
+		n, err := cx.Read(buf)
+		if err != nil {
+			if errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) || errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, 0, err
 		}
-	}
-	chi := &tls.ClientHelloInfo{
-		CipherSuites:      info.CipherSuites,
-		ServerName:        info.ServerName,
-		SupportedProtos:   offered,
-		SupportedVersions: []uint16{tls.VersionTLS13},
-		Conn:              cx,
-	}
-	for _, matcher := range m.matchers {
-		if _, isALPN := matcher.(*l4tls.MatchALPN); isALPN {
+		if n == 0 {
+			break
+		}
+		sawData = true
+		got, decErr := decryptInitial(buf[:n])
+		if decErr != nil {
+			if logger.Core().Enabled(zap.DebugLevel) {
+				logger.Debug("quic matcher: datagram is not a decryptable Initial",
+					zap.Int("bytes", n), zap.Error(decErr),
+					zap.String("head", fmt.Sprintf("%x", buf[:min(n, 12)])))
+			}
 			continue
 		}
-		if !matcher.Match(chi) {
-			return true, false
-		}
+		sawInitial = true
+		quicVer = got.version
+		fragments = append(fragments, got.fragments...)
 	}
-	return true, true
+
+	if !sawInitial {
+		if !sawData {
+			// No data prefetched yet; ask layer4 to fetch the first datagram.
+			return nil, 0, layer4.ErrConsumedAllPrefetchedBytes
+		}
+		return nil, 0, errNotQUICInitial
+	}
+
+	msg, complete := reassembleCrypto(fragments)
+	if !complete {
+		return nil, quicVer, layer4.ErrConsumedAllPrefetchedBytes
+	}
+	hello, err := parseClientHello(msg)
+	if err != nil {
+		return nil, quicVer, err
+	}
+	return hello, quicVer, nil
 }
 
-// Match returns true if the connection looks like QUIC.
+// Match returns true if the connection is a QUIC flow whose ClientHello
+// satisfies all configured handshake matchers.
 func (m *MatchQUIC) Match(cx *layer4.Connection) (bool, error) {
-	// Check if the protocol is UDP
 	if _, isUDP := cx.LocalAddr().(*net.UDPAddr); !isUDP && !strings.HasPrefix(cx.LocalAddr().Network(), "udp") {
 		return false, nil
 	}
 
-	// Read one byte
-	n := 1
-	buf := make([]byte, n)
-	_, err := io.ReadAtLeast(cx, buf, n)
-	if err != nil {
-		return m.matchError(err)
-	}
-
-	// Ensure the second bit of the first byte is set, i.e. continue if
-	// github.com/quic-go/quic-go/internal/wire.IsPotentialQUICPacket(buf[0]).
-	qFirstByte := buf[0]
-	if qFirstByte&QUICMagicBitValue == 0 {
-		return false, nil
-	}
-
-	// Ensure the first bit of the first byte is set, i.e. continue if
-	// github.com/quic-go/quic-go/internal/wire.IsLongHeaderPacket(buf[0]).
-	// Note: this behaviour may be changed in the future if there are packets
-	// that should be considered valid despite having the first bit unset.
-	if qFirstByte&QUICLongHeaderBitValue == 0 {
-		return false, nil
-	}
-
-	// Read the remaining bytes of the initial frame. Sized to MaxBufLen to
-	// accommodate any valid MTU (IPv4 1472, IPv6 1452, jumbo frames, loopback).
-	buf = make([]byte, layer4.MaxBufLen)
-	buf[0] = qFirstByte
-	n, err = io.ReadAtLeast(cx, buf[1:], 1)
-	if err != nil || !validQUICInitialLength(n+1) {
-		if cx.Logger.Core().Enabled(zap.DebugLevel) {
-			cx.Logger.Debug("quic matcher: initial datagram rejected",
-				zap.Int("bytes", n+1),
-				zap.Error(err),
-			)
+	logger := cx.Logger
+	hello, quicVer, err := m.sniffClientHello(cx, logger)
+	if err == nil {
+		chi := clientHelloInfo(cx, hello)
+		repl := cx.Replacer()
+		tlsVersion := uint16(tls.VersionTLS13)
+		if len(hello.supportedVersions) > 0 {
+			tlsVersion = hello.supportedVersions[0]
 		}
-		return m.matchError(err)
-	}
-	version := quic.Version(binary.BigEndian.Uint32(buf[1:5]))
-	if cx.Logger.Core().Enabled(zap.DebugLevel) {
-		cx.Logger.Debug("quic matcher: read initial datagram",
-			zap.Int("bytes", n+1),
-			zap.String("version", version.String()),
-		)
-	}
+		repl.Set(quicTLSServerNameReplKey, hello.serverName)
+		repl.Set(quicTLSVersionReplKey, caddytls.ProtocolName(tlsVersion))
+		repl.Set(quicVersionReplKey, quicVersionName(quicVer))
 
-	// Use a workaround to match ALPNs. This way quic.EarlyListener.Accept() exits on deadline
-	// if it receives a packet having an ALPN other than those present in tls.Config.NextProtos.
-	repl := cx.Replacer()
-	tlsConf := &tls.Config{Certificates: m.tlsConf.Certificates, MinVersion: tls.VersionTLS13}
-	for _, matcher := range m.matchers {
-		if alpnMatcher, ok := matcher.(*l4tls.MatchALPN); ok {
-			for _, alpnValue := range *alpnMatcher {
-				alpnValue = repl.ReplaceAll(alpnValue, "")
-				if len(alpnValue) > 0 {
-					tlsConf.NextProtos = append(tlsConf.NextProtos, alpnValue)
+		for _, matcher := range m.matchers {
+			if !matcher.Match(chi) {
+				if logger.Core().Enabled(zap.DebugLevel) {
+					logger.Debug("quic matcher: ClientHello did not satisfy matchers",
+						zap.Strings("alpn", hello.supportedProtos),
+						zap.String("sni", hello.serverName))
 				}
+				return false, nil
 			}
 		}
-	}
-
-	// All handshake matchers are evaluated as soon as the ClientHello is
-	// available. This is the authoritative match verdict: it depends only on
-	// the ClientHello (ALPN, SNI, ...), not on whether the matcher's own fake
-	// handshake with a self-signed certificate happens to complete. Match
-	// reads the flags after Accept returns, so the handoff from the handshake
-	// goroutine is done atomically.
-	// Prepare a context with a deadline
-	qContext, qCancel := context.WithDeadline(context.Background(), time.Now().Add(QUICAcceptTimeout))
-	defer qCancel()
-
-	var (
-		alpnMismatch  atomic.Bool
-		helloMismatch atomic.Bool
-		helloMatched  atomic.Bool
-	)
-	if len(tlsConf.NextProtos) > 0 || len(m.matchers) > 0 {
-		expectedALPNs := make(map[string]struct{}, len(tlsConf.NextProtos))
-		for _, p := range tlsConf.NextProtos {
-			expectedALPNs[p] = struct{}{}
+		if logger.Core().Enabled(zap.DebugLevel) {
+			logger.Debug("quic matcher: matched ClientHello",
+				zap.Strings("alpn", hello.supportedProtos),
+				zap.String("sni", hello.serverName))
 		}
-		tlsConf.GetConfigForClient = func(info *tls.ClientHelloInfo) (*tls.Config, error) {
-			alpnOK, allOK := m.evaluateClientHello(cx, info, expectedALPNs)
-			if cx.Logger.Core().Enabled(zap.DebugLevel) {
-				cx.Logger.Debug("quic matcher: evaluated ClientHello",
-					zap.Strings("supported_alpn", info.SupportedProtos),
-					zap.String("server_name", info.ServerName),
-					zap.Bool("alpn_ok", alpnOK),
-					zap.Bool("all_ok", allOK),
-				)
-			}
-			repl.Set(quicTLSServerNameReplKey, info.ServerName)
-			repl.Set(quicTLSVersionReplKey, caddytls.ProtocolName(tls.VersionTLS13))
-			repl.Set(quicVersionReplKey, version.String())
-			if !alpnOK {
-				alpnMismatch.Store(true)
-				return nil, errors.New("quic matcher: ALPN mismatch")
-			}
-			if !allOK {
-				helloMismatch.Store(true)
-				return nil, errors.New("quic matcher: handshake matcher mismatch")
-			}
-			helloMatched.Store(true)
-			qCancel()
-			return nil, nil
-		}
+		return true, nil
 	}
 
-	// Create a new fakePacketConn pipe
-	serverFPC, clientFPC := newFakePacketConnPipe(&fakePipeAddr{ID: newRand(), TS: time.Now()}, nil)
-
-	// Create a new quic.Transport
-	qTransport := quic.Transport{
-		Conn: serverFPC,
+	if errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
+		return false, err
 	}
 
-	// Launch a new quic.EarlyListener
-	var qListener *quic.EarlyListener
-	qListener, err = qTransport.ListenEarly(tlsConf, m.quicConf)
-	if err != nil {
-		_ = serverFPC.Close()
-		_ = clientFPC.Close()
-		return m.matchError(err)
+	// Sniffing failed. This is a definitive failure for this flow: no amount
+	// of additional prefetched data can turn a non-Initial into a ClientHello.
+	if logger.Core().Enabled(zap.DebugLevel) {
+		logger.Debug("quic matcher: cannot sniff ClientHello",
+			zap.Error(err))
 	}
-	// Single combined cleanup so qListener.Close() always runs (closes the
-	// upstream-leaked listener on Accept-error paths) and the fakePacketConn
-	// pipes close BEFORE the listener — closing the listener triggers the
-	// QUIC server's connection-close goroutine to write a CLOSE frame, which
-	// would otherwise deadlock on an unread pipe in the Accept-timeout case.
-	defer func() {
-		_ = serverFPC.Close()
-		_ = clientFPC.Close()
-		_ = qListener.Close()
-	}()
-
-	// Write the buffered bytes into the pipe
-	_, err = clientFPC.WriteTo(buf[:n+1], nil)
-	if err != nil {
-		return m.matchError(nil)
+	if m.MatchWhenHandshakeFails {
+		return true, nil
 	}
-
-	// Write more buffered bytes into the pipe, the writer here ensures all frames are likely quic frames based on their lengths
-	_, err = io.CopyBuffer(quicPipeWriter{clientFPC}, cx, buf)
-	if err != nil && !errors.Is(err, layer4.ErrConsumedAllPrefetchedBytes) {
-		return m.matchError(err)
-	}
-
-	// return if there are more data to be read, usually there will be frames buffered at the start of a connection.
-	if cx.HasMore() {
-		return false, layer4.ErrConsumedAllPrefetchedBytes
-	}
-
-	// spawn a new go routine to monitor new data. It's possible the available data is enough to determine the quic connection and the context is wrongly canceled.
-	done := make(chan struct{})
-	go func() {
-		// close(done) lives in a deferred recovery so a future refactor
-		// that breaks the cx.isPacketConn invariant (or any other panic
-		// inside WaitForMore) cannot leave Match() blocked forever at
-		// the <-done wait below. Logs the panic + remote addr so
-		// operators can attribute the symptom.
-		defer func() {
-			if r := recover(); r != nil {
-				cx.Logger.Error("panic in quic matcher WaitForMore goroutine",
-					zap.String("network", cx.LocalAddr().Network()),
-					zap.String("local", cx.LocalAddr().String()),
-					zap.String("remote", cx.RemoteAddr().String()),
-					zap.Any("panic", r),
-				)
-			}
-			close(done)
-		}()
-		// during testing the connection is not a packet conn
-		if isTesting {
-			return
-		}
-		_ = cx.WaitForMore(qContext)
-		qCancel()
-	}()
-
-	// Accept a new quic.EarlyConnection
-	var qConn *quic.Conn
-	qConn, err = qListener.Accept(qContext)
-	qCancel()
-	<-done
-	if err != nil {
-		// Log unexpected error classes at WARN; expected timeout/cancel
-		// races at DEBUG. Field order follows vnxme's review: network,
-		// local, remote, then the diagnostic value.
-		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
-			cx.Logger.Warn("quic matcher: unexpected Accept() error",
-				zap.String("network", cx.LocalAddr().Network()),
-				zap.String("local", cx.LocalAddr().String()),
-				zap.String("remote", cx.RemoteAddr().String()),
-				zap.Error(err))
-		} else {
-			cx.Logger.Debug("quic matcher: Accept() timeout or cancel",
-				zap.String("network", cx.LocalAddr().Network()),
-				zap.String("local", cx.LocalAddr().String()),
-				zap.String("remote", cx.RemoteAddr().String()),
-				zap.Error(err))
-		}
-		// The ClientHello verdict outranks the fake handshake's fate: a
-		// configured ALPN/SNI match is a match even if the self-signed cert
-		// or the 1s deadline stops the fake handshake. Only flows with no
-		// ClientHello verdict fall back to match_when_handshake_fails.
-		return acceptErrorResult(alpnMismatch.Load(), helloMismatch.Load(), helloMatched.Load(), m.MatchWhenHandshakeFails, qContext.Err())
-	}
-
-	// Obtain a quic.ConnectionState
-	qState := qConn.ConnectionState()
-
-	// Add values to the replacer
-	repl.Set(quicTLSServerNameReplKey, qState.TLS.ServerName)
-	repl.Set(quicTLSVersionReplKey, caddytls.ProtocolName(qState.TLS.Version))
-	repl.Set(quicVersionReplKey, qState.Version.String())
-
-	// Fill a tls.ClientHelloInfo structure
-	chi := &tls.ClientHelloInfo{
-		CipherSuites:      []uint16{qState.TLS.CipherSuite},
-		ServerName:        qState.TLS.ServerName,
-		SupportedCurves:   nil,
-		SupportedPoints:   nil,
-		SignatureSchemes:  nil,
-		SupportedProtos:   []string{qState.TLS.NegotiatedProtocol}, // Empty if no ALPNs are provided
-		SupportedVersions: []uint16{tls.VersionTLS13},              // Presumed to always be TLS 1.3
-		Conn:              cx,
-	}
-
-	// Check TLS matchers if any
-	for _, matcher := range m.matchers {
-		// ALPN matching is implicitly done above when the QUIC listener is initialised,
-		// as quic.EarlyConnection.ConnectionState().TLS.NegotiatedProtocol is only filled
-		// when the client's ALPN matches one of the values set in tls.Config.NextProtos.
-		if _, isMatchALPN := matcher.(*l4tls.MatchALPN); isMatchALPN {
-			continue
-		}
-
-		// TODO: even though we have more data than the standard lib's
-		// ClientHelloInfo lets us fill, the matcher modules we use do
-		// not accept our own type; but the advantage of this is that
-		// we can reuse TLS connection matchers from the tls app - but
-		// it would be nice if we found a way to give matchers all
-		// the information
-		if !matcher.Match(chi) {
-			return false, nil
-		}
-	}
-
-	return true, nil
+	return false, nil
 }
 
-// Provision prepares m's internal structures.
+// Provision prepares the internal matchers.
 func (m *MatchQUIC) Provision(ctx caddy.Context) error {
-	// Load TLS matchers
 	mods, err := ctx.LoadModule(m, "MatchersRaw")
 	if err != nil {
 		return fmt.Errorf("loading TLS matchers: %v", err)
@@ -457,52 +188,12 @@ func (m *MatchQUIC) Provision(ctx caddy.Context) error {
 	for _, modAny := range mods.(map[string]any) {
 		m.matchers = append(m.matchers, modAny.(caddytls.ConnectionMatcher))
 	}
-
-	// Generate a new private key
-	var key *ecdsa.PrivateKey
-	key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return fmt.Errorf("generating a private key: %v", err)
-	}
-
-	// Compose a new x509 certificate template
-	template := &x509.Certificate{
-		SerialNumber: newRand(),
-		Subject: pkix.Name{
-			CommonName:   QUICCertificateCommonName,
-			Organization: []string{QUICCertificateOrganization},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(QUICCertificateValidityPeriod),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{QUICCertificateSubjectAltName},
-	}
-
-	// Create a new x509 certificate
-	var cert []byte
-	cert, err = x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		return fmt.Errorf("generating a x509 certificate: %v", err)
-	}
-
-	// Initialize a new TLS config
-	m.tlsConf = &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{cert}, PrivateKey: key}},
-		MinVersion:   tls.VersionTLS13,
-	}
-
-	// Initialize a new QUIC config
-	m.quicConf = &quic.Config{}
-
 	return nil
 }
 
 // UnmarshalCaddyfile sets up the MatchQUIC from Caddyfile tokens. Syntax:
 //
 //	quic {
-//		<matcher> [<args...>]
 //		<matcher> [<args...>]
 //	}
 //	quic <matcher> [<args...>]
@@ -519,8 +210,8 @@ func (m *MatchQUIC) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// UnmarshalJSON satisfies the json.Unmarshaler interface. The option is
-// pulled out before the remaining keys are loaded as handshake matchers.
+// UnmarshalJSON satisfies json.Unmarshaler. The option is pulled out before
+// the remaining keys are loaded as handshake matchers.
 func (m *MatchQUIC) UnmarshalJSON(b []byte) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(b, &fields); err != nil {
@@ -539,12 +230,10 @@ func (m *MatchQUIC) UnmarshalJSON(b []byte) error {
 	return json.Unmarshal(rest, &m.MatchersRaw)
 }
 
-// MarshalJSON satisfies the json.Marshaler interface.
+// MarshalJSON satisfies json.Marshaler.
 func (m *MatchQUIC) MarshalJSON() ([]byte, error) {
 	out := make(caddy.ModuleMap, len(m.MatchersRaw)+1)
-	for name, raw := range m.MatchersRaw {
-		out[name] = raw
-	}
+	maps.Copy(out, m.MatchersRaw)
 	if m.MatchWhenHandshakeFails {
 		raw, err := json.Marshal(true)
 		if err != nil {
@@ -555,114 +244,14 @@ func (m *MatchQUIC) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// fakePipeAddr satisfies net.Addr and uses a random number and a timestamp
-// to avoid panic in quic.connMultiplexer.AddConn() due to the same local address.
-type fakePipeAddr struct {
-	ID *big.Int
-	TS time.Time
-}
-
-func (fpa fakePipeAddr) Network() string {
-	return "pipe"
-}
-
-func (fpa fakePipeAddr) String() string {
-	return fmt.Sprintf("fake_%v_%v", fpa.ID.String(), fpa.TS.UnixNano())
-}
-
-// fakePacketConn implements a true packet-oriented net.PacketConn for
-// feeding synthetic datagrams to quic.Transport without streaming or blocking.
-type fakePacketConn struct {
-	local   net.Addr
-	remote  net.Addr
-	inCh    chan []byte
-	outCh   chan []byte
-	lastPkt []byte
-	mu      sync.RWMutex
-	closed  bool
-}
-
-func (fpc *fakePacketConn) LocalAddr() net.Addr {
-	return fpc.local
-}
-
-func (fpc *fakePacketConn) RemoteAddr() net.Addr {
-	return fpc.remote
-}
-
-func (fpc *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	if len(fpc.lastPkt) > 0 {
-		n := copy(p, fpc.lastPkt)
-		fpc.lastPkt = fpc.lastPkt[n:]
-		return n, fpc.remote, nil
-	}
-	pkt, ok := <-fpc.inCh
-	if !ok {
-		return 0, fpc.remote, io.EOF
-	}
-	n := copy(p, pkt)
-	if n < len(pkt) {
-		fpc.lastPkt = pkt[n:]
-	}
-	return n, fpc.remote, nil
-}
-
-func (fpc *fakePacketConn) Read(p []byte) (int, error) {
-	n, _, err := fpc.ReadFrom(p)
-	return n, err
-}
-
-func (fpc *fakePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	fpc.mu.RLock()
-	defer fpc.mu.RUnlock()
-	if fpc.closed {
-		return 0, io.ErrClosedPipe
-	}
-	pkt := make([]byte, len(p))
-	copy(pkt, p)
-	select {
-	case fpc.outCh <- pkt:
-		return len(p), nil
-	default:
-		// Drop when buffer is full so the fake sender never blocks or deadlocks
-		return len(p), nil
-	}
-}
-
-func (fpc *fakePacketConn) Write(p []byte) (int, error) {
-	return fpc.WriteTo(p, nil)
-}
-
-func (fpc *fakePacketConn) Close() error {
-	fpc.mu.Lock()
-	if !fpc.closed {
-		fpc.closed = true
-		close(fpc.outCh)
-	}
-	fpc.mu.Unlock()
-	return nil
-}
-
-func (fpc *fakePacketConn) SetDeadline(_ time.Time) error      { return nil }
-func (fpc *fakePacketConn) SetReadDeadline(_ time.Time) error  { return nil }
-func (fpc *fakePacketConn) SetWriteDeadline(_ time.Time) error { return nil }
-func (fpc *fakePacketConn) SetReadBuffer(_ int) error          { return nil }
-func (fpc *fakePacketConn) SetWriteBuffer(_ int) error         { return nil }
-
 // Interface guards
 var (
 	_ caddy.Provisioner     = (*MatchQUIC)(nil)
 	_ caddyfile.Unmarshaler = (*MatchQUIC)(nil)
 	_ layer4.ConnMatcher    = (*MatchQUIC)(nil)
-
-	_ net.Addr = (*fakePipeAddr)(nil)
-
-	_ net.PacketConn                         = (*fakePacketConn)(nil)
-	_ interface{ SetReadBuffer(int) error }  = (*fakePacketConn)(nil)
-	_ interface{ SetWriteBuffer(int) error } = (*fakePacketConn)(nil)
 )
 
-// Replacer prefixes and keys; names of context variables
+// Replacer prefixes and keys; names of context variables.
 const (
 	quicReplPrefix = layer4.AppReplPrefix + "quic."
 
@@ -671,51 +260,16 @@ const (
 	quicVersionReplKey       = quicReplPrefix + "version"
 )
 
-var (
-	QUICAcceptTimeout = 1 * time.Second
-)
-
-const (
-	QUICCertificateCommonName     = "layer4"
-	QUICCertificateOrganization   = "caddy"
-	QUICCertificateSubjectAltName = "*"
-	QUICCertificateValidityPeriod = time.Hour * 24 * 365 * 20
-
-	QUICLongHeaderBitValue uint8 = 0x80 // github.com/quic-go/quic-go/internal/wire.IsLongHeaderPacket()
-	QUICMagicBitValue      uint8 = 0x40 // github.com/quic-go/quic-go/internal/wire.IsPotentialQUICPacket()
-
-	QUICPacketBytesMax = 1500
-	QUICPacketBytesMin = 1200 // github.com/quic-go/quic-go/internal/protocol.MinInitialPacketSize
-)
-
-func newFakePacketConnPipe(local, remote net.Addr) (*fakePacketConn, *fakePacketConn) {
-	if local == nil && remote == nil {
-		local = &fakePipeAddr{ID: newRand(), TS: time.Now()}
-		remote = local
-	} else if local == nil {
-		local = remote
-	} else if remote == nil {
-		remote = local
+// quicVersionName mirrors the sniffer's version naming for the replacer.
+func quicVersionName(v uint32) string {
+	switch v {
+	case quicVersionDraft29:
+		return "draft-29"
+	case quicVersion2:
+		return "v2"
+	case quicVersion1:
+		return "v1"
+	default:
+		return fmt.Sprintf("0x%x", v)
 	}
-	ch1 := make(chan []byte, 32)
-	ch2 := make(chan []byte, 32)
-
-	serverFPC := &fakePacketConn{
-		local:  local,
-		remote: remote,
-		inCh:   ch1,
-		outCh:  ch2,
-	}
-	clientFPC := &fakePacketConn{
-		local:  remote,
-		remote: local,
-		inCh:   ch2,
-		outCh:  ch1,
-	}
-	return serverFPC, clientFPC
-}
-
-func newRand() *big.Int {
-	rnd, _ := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
-	return rnd
 }

@@ -34,7 +34,7 @@ import (
 
 const (
 	idleTimeoutDefault     = 30 * time.Second
-	MatchingTimeoutDefault = 3 * time.Second
+	MatchingTimeoutDefault = 10 * time.Second
 )
 
 // Server represents a Caddy layer4 server.
@@ -50,7 +50,7 @@ type Server struct {
 	// Maximum time before packet connection association (by downstream address:port) is removed. Default: 30s.
 	// Note: this field is only relevant for packet connections (e.g., UDP).
 	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
-	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 3s.
+	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 10s.
 	MatchingTimeout caddy.Duration `json:"matching_timeout,omitempty"`
 
 	logger        *zap.Logger

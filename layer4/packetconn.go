@@ -21,7 +21,7 @@ type PacketConnWrapper struct {
 
 	// Maximum time before packet connection association (by downstream address:port) is removed. Default: 30s.
 	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
-	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 3s.
+	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 10s.
 	MatchingTimeout caddy.Duration `json:"matching_timeout,omitempty"`
 
 	compiledRoute Handler

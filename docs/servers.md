@@ -40,8 +40,10 @@ Known limitations of packet connection wrappers:
   updated by a config reload as long as the socket stays open, i.e. until Caddy stops serving HTTP/3 on its address.
   Restart Caddy to apply changes to these routes.
 - The packets of a flow aren't passed to the HTTP app until no route can match it, so a matcher waiting for more data
-  delays HTTP/3 connections by up to `matching_timeout`. Prefer matchers that recognize a protocol by its first packet,
-  e.g. `dns`, `quic`, `wireguard`, and keep `matching_timeout` short.
+  delays HTTP/3 connections by up to `matching_timeout` (10s by default). The generous default leaves room for
+  high-RTT (200ms+) flows whose QUIC ClientHello spans multiple datagrams. Prefer matchers that recognize a
+  protocol by its first packet, e.g. `dns`, `quic`, `wireguard`; such flows don't wait for the full timeout.
+  Lower `matching_timeout` if fastest HTTP/3 setup matters more than slow-path classification.
 - Caddy's HTTP/3 server gets a generic packet connection rather than the UDP socket, so it can't use socket-specific
   optimizations. On a host with several IP addresses, replies may be sent from an address other than the one
   a client has sent to, unless Caddy listens on a specific address.
@@ -74,7 +76,7 @@ Below is a list of valid [network address](https://caddyserver.com/docs/conventi
 | `unixpacket//var/run/caddy-l4.sock` | Unixpacket | `/var/run/caddy-l4.sock` |
 
 Any server, listener wrapper or packet connection wrapper has `matching_timeout` field which is the maximum time
-connections have to complete the matching phase (the first terminal handler is matched). By default, it equals 3s.
+connections have to complete the matching phase (the first terminal handler is matched). By default, it equals 10s.
 Any server handling UDP and any packet connection wrapper also has `idle_timeout` field which is the maximum time
 a flow of packets from a client address:port may stay idle before it ends. By default, it equals 30s.
 

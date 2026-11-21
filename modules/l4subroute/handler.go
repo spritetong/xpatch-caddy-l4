@@ -37,7 +37,7 @@ type Handler struct {
 	// The primary list of routes to compile and execute.
 	Routes layer4.RouteList `json:"routes,omitempty"`
 
-	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 3s.
+	// Maximum time connections have to complete the matching phase (the first terminal handler is matched). Default: 10s.
 	MatchingTimeout caddy.Duration `json:"matching_timeout,omitempty"`
 
 	logger *zap.Logger
